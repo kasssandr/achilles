@@ -81,9 +81,10 @@ def _parse_stats(stdout: str) -> dict:
         ("notes_found",       r"Found\s+(\d+)\s+notes"),
         ("unmatched",         r"Unmatched notes:\s+(\d+)"),
         ("mocs_created",      r"Created\s+(\d+)\s+MOC"),
-        ("notes_updated",     r"Updated\s+(\d+)\s+notes? with related"),
-        ("inline_links",      r"Inserted\s+(\d+)\s+inline link"),
-        ("semantic_links",    r"Added\s+(\d+)\s+semantic"),
+        ("notes_updated",     r"Updated\s+(\d+)\s+note\(s\)"),
+        ("semantic_backed",   r"davon\s+(\d+)\s+semantisch gestützt"),
+        ("embeddings_loaded", r"(\d+)\s+Dokument-Embeddings geladen"),
+        ("inline_links",      r"Linked\s+(\d+)\s+note\(s\)"),
     ):
         m = re.search(pat, stdout)
         if m:
@@ -167,10 +168,12 @@ def main() -> int:
         })
         return 0
 
+    # Semantic linking is link_vault's default since the 2026-08 rework;
+    # inline linking is opt-in there and stays off for the routine.
     cmd = [
         sys.executable, str(link_vault_script),
         str(library_path),
-        "--semantic", "--apply",
+        "--apply",
     ]
 
     if args.dry_run:

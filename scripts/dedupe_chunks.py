@@ -36,7 +36,7 @@ import signal
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -125,6 +125,63 @@ def plan_dedupe(rows: list[dict]) -> dict:
         "differing_ids": differing,
         "differing_examples": differing_examples,
     }
+
+
+def _runs(stamps: list[datetime], gap: timedelta) -> list[datetime]:
+    """Group sorted timestamps into runs, returning each run's start."""
+    starts = [stamps[0]]
+    for previous, current in zip(stamps, stamps[1:]):
+        if current - previous > gap:
+            starts.append(current)
+    return starts
+
+
+def plan_stale(rows: list[dict], gap_minutes: int = 15) -> dict:
+    """Find rows left over from an earlier indexing run of the same book.
+
+    Chunk ids are positional (`<book>_comment_3`, `<book>_annot_7`). When a
+    comment is shortened or a highlight removed, the current run writes fewer
+    chunks and the high numbers from the previous run keep sitting in the
+    table. They are not duplicates - no id repeats - so deduping never touches
+    them, yet they answer searches with text the book no longer contains.
+
+    A "run" is a cluster of `indexed_at` stamps less than `gap_minutes` apart:
+    writing a few thousand chunks takes minutes, so a single run spans several
+    timestamps. Any surviving row older than its book's newest run is stale.
+    """
+    gap = timedelta(minutes=gap_minutes)
+
+    newest_per_id: dict[str, dict] = {}
+    for row in rows:
+        current = newest_per_id.get(row["id"])
+        if current is None or str(row.get("indexed_at") or "") > str(current.get("indexed_at") or ""):
+            newest_per_id[row["id"]] = row
+
+    by_book: dict[str, list[dict]] = defaultdict(list)
+    for row in newest_per_id.values():
+        by_book[row.get("book_id", "")].append(row)
+
+    stale_ids: list[str] = []
+    books: Counter = Counter()
+    for book, book_rows in by_book.items():
+        stamps = sorted({s for s in (_parse_stamp(r.get("indexed_at")) for r in book_rows) if s})
+        if len(stamps) < 2:
+            continue
+        last_start = _runs(stamps, gap)[-1]
+        for row in book_rows:
+            stamp = _parse_stamp(row.get("indexed_at"))
+            if stamp is not None and stamp < last_start:
+                stale_ids.append(row["id"])
+                books[book] += 1
+
+    return {"stale_ids": sorted(stale_ids), "books": books}
+
+
+def _parse_stamp(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value)[:19])
+    except (TypeError, ValueError):
+        return None
 
 
 def print_report(plan: dict, chunk_type: str | None, top: int = 12) -> None:
@@ -250,6 +307,37 @@ def dedupe(table, dup_ids: list[str], batch_size: int, checkpoint: Path,
     return stats
 
 
+def drop_stale(table, stale_ids: list[str], batch_size: int, chunk_type: str | None,
+               backup_path: Path) -> int:
+    """Back up and delete rows left over from earlier runs."""
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = None
+    deleted = 0
+    try:
+        for start in range(0, len(stale_ids), batch_size):
+            if _interrupted:
+                break
+            batch = stale_ids[start:start + batch_size]
+            predicate = _batch_filter(batch, chunk_type)
+
+            arrow = table.search().where(predicate).limit(0).to_arrow()
+            if arrow.num_rows == 0:
+                continue
+            if writer is None:
+                writer = pq.ParquetWriter(backup_path, arrow.schema)
+            writer.write_table(arrow)
+
+            before = table.count_rows()
+            table.delete(predicate)
+            deleted += before - table.count_rows()
+            print(f"  deleted {deleted:,}/{len(stale_ids):,} stale rows", end="\r")
+    finally:
+        if writer is not None:
+            writer.close()
+    print()
+    return deleted
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Remove duplicate LanceDB rows sharing a chunk id (keeps the newest)."
@@ -265,6 +353,11 @@ def main() -> int:
     parser.add_argument("--db-path", help="LanceDB directory (default: configured rag_db)")
     parser.add_argument("--backup-dir",
                         help="Where to write the Parquet backup (default: <db>/../backups)")
+    parser.add_argument("--drop-stale", action="store_true",
+                        help="Also delete rows left over from an earlier run of the same book "
+                             "(positional ids that the current run no longer writes)")
+    parser.add_argument("--gap-minutes", type=int, default=15,
+                        help="Timestamps closer than this belong to the same run (default: 15)")
     parser.add_argument("--dump-differing", metavar="FILE",
                         help="Write the differing-text rows that would be dropped to a JSON file")
     parser.add_argument("--yes", action="store_true",
@@ -288,6 +381,14 @@ def main() -> int:
     plan = plan_dedupe(rows)
     print_report(plan, chunk_type)
 
+    stale = {"stale_ids": [], "books": Counter()}
+    if args.drop_stale:
+        stale = plan_stale(rows, args.gap_minutes)
+        print(f"\n  Stale rows (earlier run) {len(stale['stale_ids']):>9,}")
+        print(f"  Books affected ........ {len(stale['books']):>9,}")
+        for book_id, n in stale["books"].most_common(5):
+            print(f"    {book_id:>8}  {n:>7,}")
+
     if args.dump_differing:
         out = Path(args.dump_differing)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -296,8 +397,8 @@ def main() -> int:
         print(f"\n  Differing-text rows written to {out}")
 
     dup_ids = plan["duplicate_ids"]
-    if not dup_ids:
-        print("\nNothing to do - no duplicated ids.")
+    if not dup_ids and not stale["stale_ids"]:
+        print("\nNothing to do - no duplicated ids, no stale rows.")
         return 0
 
     if args.limit:
@@ -309,7 +410,8 @@ def main() -> int:
         return 0
 
     if not args.yes:
-        answer = input(f"\nDelete {plan['excess_rows']:,} rows? [y/N] ").strip().lower()
+        total = plan["excess_rows"] + len(stale["stale_ids"])
+        answer = input(f"\nDelete {total:,} rows? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")
             return 1
@@ -324,12 +426,21 @@ def main() -> int:
             print("Another ARCHILLES routine holds the lock - try again later.")
             return 1
 
-        print(f"\nBacking up affected rows -> {backup_path}")
-        backup_rows(table, dup_ids, backup_path, args.batch_size, chunk_type)
-
-        print(f"\nDeduping {len(dup_ids):,} ids ...")
         t0 = time.time()
-        stats = dedupe(table, dup_ids, args.batch_size, checkpoint, chunk_type)
+        stats = {"ids": 0, "deleted": 0, "reinserted": 0, "batches": 0}
+        if dup_ids:
+            print(f"\nBacking up affected rows -> {backup_path}")
+            backup_rows(table, dup_ids, backup_path, args.batch_size, chunk_type)
+
+            print(f"\nDeduping {len(dup_ids):,} ids ...")
+            stats = dedupe(table, dup_ids, args.batch_size, checkpoint, chunk_type)
+
+        stale_deleted = 0
+        if stale["stale_ids"] and not _interrupted:
+            stale_backup = backup_path.with_name(backup_path.stem + "_stale.parquet")
+            print(f"\nDropping {len(stale['stale_ids']):,} stale rows -> backup {stale_backup.name}")
+            stale_deleted = drop_stale(table, stale["stale_ids"], args.batch_size,
+                                       chunk_type, stale_backup)
         elapsed = time.time() - t0
 
     print(f"\n{'=' * 62}")
@@ -337,6 +448,8 @@ def main() -> int:
     print(f"  rows deleted .......... {stats['deleted']:>9,}")
     print(f"  rows re-inserted ...... {stats['reinserted']:>9,}")
     print(f"  net rows removed ...... {stats['deleted'] - stats['reinserted']:>9,}")
+    if args.drop_stale:
+        print(f"  stale rows deleted .... {stale_deleted:>9,}")
     print(f"  elapsed ............... {elapsed / 60:>9.1f} min")
     print(f"  backup ................ {backup_path}")
     print(f"{'=' * 62}")

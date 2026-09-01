@@ -63,11 +63,21 @@ def _sql_quote(value: str) -> str:
     return str(value).replace("'", "''")
 
 
-def load_rows(table, chunk_type: str | None) -> list[dict]:
-    """Read the projection for one chunk_type (or the whole table)."""
-    query = table.search()
+def load_rows(table, chunk_type: str | None, book_id: str | None = None) -> list[dict]:
+    """Read the projection for one chunk_type (or the whole table).
+
+    `book_id` narrows the scan to a single book. That matters for the content
+    type: loading a million-plus rows with their text just to clean one book
+    would need gigabytes of memory for nothing.
+    """
+    conditions = []
     if chunk_type:
-        query = query.where(f"chunk_type = '{_sql_quote(chunk_type)}'")
+        conditions.append(f"chunk_type = '{_sql_quote(chunk_type)}'")
+    if book_id:
+        conditions.append(f"book_id = '{_sql_quote(book_id)}'")
+    query = table.search()
+    if conditions:
+        query = query.where(" AND ".join(conditions))
     return query.select(PROJECTION).limit(0).to_list()
 
 
@@ -353,6 +363,8 @@ def main() -> int:
     parser.add_argument("--db-path", help="LanceDB directory (default: configured rag_db)")
     parser.add_argument("--backup-dir",
                         help="Where to write the Parquet backup (default: <db>/../backups)")
+    parser.add_argument("--book", metavar="BOOK_ID",
+                        help="Restrict the cleanup to a single book_id")
     parser.add_argument("--drop-stale", action="store_true",
                         help="Also delete rows left over from an earlier run of the same book "
                              "(positional ids that the current run no longer writes)")
@@ -373,9 +385,12 @@ def main() -> int:
     db = lancedb.connect(str(db_path))
     table = db.open_table("chunks")
 
-    print(f"Reading rows ({chunk_type or 'all types'}) ...")
+    scope = chunk_type or 'all types'
+    if args.book:
+        scope += f", book {args.book}"
+    print(f"Reading rows ({scope}) ...")
     t0 = time.time()
-    rows = load_rows(table, chunk_type)
+    rows = load_rows(table, chunk_type, args.book)
     print(f"   {len(rows):,} rows in {time.time() - t0:.1f}s")
 
     plan = plan_dedupe(rows)

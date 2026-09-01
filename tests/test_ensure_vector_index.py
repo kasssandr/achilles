@@ -102,3 +102,15 @@ class TestOptimizeIndexes:
         assert store.optimize_indexes(retain_days=7) is True
 
         assert calls == [{"cleanup_older_than": timedelta(days=7)}]
+
+    def test_default_retention_is_two_days(self, store):
+        # watchdog.py calls optimize_indexes() without arguments after every
+        # run, so the default is what the production database actually gets.
+        # Seven days kept a week of ~16 GB index copies: the live DB sat at
+        # 133 GB with its oldest version six days old, nothing collectable.
+        calls = []
+        store.table = SimpleNamespace(optimize=lambda **kw: calls.append(kw))
+
+        assert store.optimize_indexes() is True
+
+        assert calls == [{"cleanup_older_than": timedelta(days=2)}]

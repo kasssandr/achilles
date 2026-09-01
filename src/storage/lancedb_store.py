@@ -244,7 +244,7 @@ class LanceDBStore:
             logger.warning(f"Could not create vector index: {e}")
             return False
 
-    def optimize_indexes(self, retain_days: int = 7) -> bool:
+    def optimize_indexes(self, retain_days: int = 2) -> bool:
         """Merge rows added since the last index build into existing indexes.
 
         Incremental (unlike the full rebuilds in create_indexes/
@@ -258,6 +258,12 @@ class LanceDBStore:
         rewrites accumulate (a 1.5M-chunk IVF-PQ index is ~16 GB per copy).
         Versions younger than ``retain_days`` survive so that a concurrent
         reader holding an older manifest is not pulled out from under.
+
+        Two days, not seven: the retention window costs one index copy per
+        routine run, and at this corpus size the seven-day window kept the
+        database at 133 GB with nothing old enough to collect. A single
+        machine running one routine at a time does not need a week of
+        manifests; two days still covers a reader that started yesterday.
 
         Returns True on success.
         """

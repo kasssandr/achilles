@@ -642,9 +642,16 @@ class Indexer:
         """
         Phase 1 indexing: Metadata + comments + annotations (fast, no fulltext).
 
-        Creates a single searchable chunk with all metadata fields, plus
-        annotation chunks (carrying annotation_hash) when the book has
-        highlights/notes — the watchdog diffs against that hash.
+        Creates a bibliographic stub chunk (title/author/publisher/…), plus
+        structure-aware calibre_comment chunks from the same
+        _build_comment_chunks() that phase 2 uses, plus annotation chunks
+        (carrying annotation_hash) when the book has highlights/notes — the
+        watchdog diffs against that hash.
+
+        The stub and the comment chunks both carry metadata_hash, so phase1
+        books take part in the watchdog's metadata diff: a comment written
+        after the stub was created is picked up on the next scan instead of
+        waiting for phase 2.
 
         Args:
             book_path: Path to book file
@@ -694,9 +701,10 @@ class Indexer:
         if book_metadata.get('description'):
             metadata_parts.append(f"Description: {book_metadata['description']}")
 
-        # Calibre comments (most important for search!)
-        if book_metadata.get('comments'):
-            metadata_parts.append(f"\n[CALIBRE COMMENT]\n{book_metadata['comments']}")
+        # Calibre comments are deliberately NOT inlined here — they go into
+        # dedicated calibre_comment chunks below, exactly as in phase 2. Inlining
+        # flattened a whole comment (up to 20k+ words) into one oversized vector,
+        # and PHASE1_METADATA misses the comment score boost in search.py.
 
         # Combine into single searchable text
         searchable_text = "\n".join(metadata_parts)
@@ -729,6 +737,14 @@ class Indexer:
         if book_metadata.get('custom_fields'):
             chunk_metadata['custom_fields'] = json.dumps(book_metadata['custom_fields'])
 
+        # metadata_hash puts phase1 books into the watchdog's metadata diff.
+        # Without it get_hashes_for_indexed_books() reports '' for the book,
+        # the scanner's `meta_changed = bool(stored_meta_hash) and ...` is
+        # always False, and the stub stays frozen at the state it had when it
+        # was first written — every later comment edit is lost until phase 2.
+        meta_hash = self._resolve_metadata_hash(book_id, book_metadata)
+        chunk_metadata['metadata_hash'] = meta_hash
+
         chunk_metadata['source_file'] = str(book_path)
 
         # Index in LanceDB
@@ -741,11 +757,27 @@ class Indexer:
         chunks = [chunk_data]
         embedding_arrays = [np.array([embedding])]
 
+        # Calibre comments as structure-aware chunks — same treatment as phase 2:
+        # H2–H4 sections, bold/key passages hoisted as "Key points:", and a
+        # 400-word split at sentence boundaries for long sections.
+        comment_count = 0
+        if book_metadata.get('comments') or book_metadata.get('comments_html'):
+            comment_chunks, comment_embeddings = self._build_comment_chunks(
+                book_metadata=book_metadata,
+                book_id=book_id,
+                book_format=chunk_metadata['format'],
+                metadata_hash=meta_hash,
+            )
+            if comment_chunks:
+                chunks.extend(comment_chunks)
+                embedding_arrays.append(np.array(comment_embeddings))
+                comment_count = len(comment_chunks)
+
         # Persist annotations + annotation_hash on stubs too: the watchdog
         # compares the stored hash against the freshly computed one, so a stub
         # without it is re-flagged as annotations_changed on every scan and
-        # delta-rewritten forever. metadata_hash stays '' — stubs deliberately
-        # do not participate in the metadata diff.
+        # delta-rewritten forever. metadata_hash mirrors the stub's own hash so
+        # every chunk of the book reports the same value.
         annot_count = 0
         try:
             annot_result = get_combined_annotations(
@@ -763,7 +795,7 @@ class Indexer:
                     book_title=title,
                     annotation_hash=annot_hash,
                     book_format=chunk_metadata['format'],
-                    metadata_hash='',
+                    metadata_hash=meta_hash,
                     book_metadata=book_metadata,
                     indexed_at=chunk_metadata['indexed_at'],
                 )
@@ -779,6 +811,8 @@ class Indexer:
 
         embeddings_array = np.concatenate(embedding_arrays)
         self._rag.store.add_chunks(chunks, embeddings_array)
+        if comment_count:
+            print(f"    Added {comment_count} comment chunk(s)")
         if annot_count:
             print(f"    Added {annot_count} annotation chunk(s)")
 

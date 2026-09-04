@@ -967,7 +967,14 @@ class LanceDBStore:
         state['total'] = len(rows)
         for row in rows:
             ctype = row.get('chunk_type')
-            if ctype in ChunkType.HIERARCHICAL_TYPES:
+            # CONTENT_TYPES, not HIERARCHICAL_TYPES (finding 1.13). The two
+            # differ on EXCHANGE, and this method and
+            # get_hashes_for_indexed_books used one each — so a dialogue-chunked
+            # document had fulltext according to the watchdog and no content
+            # according to index_book, which would then replace its structured
+            # chunks with generic extraction. CONTENT_TYPES is authoritative for
+            # "this book has fulltext"; both queries now use it.
+            if ctype in ChunkType.CONTENT_TYPES:
                 state['content_count'] += 1
                 if not meta_from_content:
                     meta_from_content = _clean(row.get('metadata_hash'))

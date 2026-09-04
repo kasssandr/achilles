@@ -46,6 +46,7 @@ import lancedb                                               # noqa: E402
 import pyarrow.parquet as pq                                 # noqa: E402
 
 from src.archilles.config import get_rag_db_path             # noqa: E402
+from src.archilles.constants import ChunkType                # noqa: E402
 from src.archilles.runtime_lock import routine_lock          # noqa: E402
 
 PROJECTION = ["id", "book_id", "text", "indexed_at"]
@@ -220,11 +221,41 @@ def _batch_filter(batch: list[str], chunk_type: str | None) -> str:
     bare `id IN (...)` delete would also remove a content row that happens to
     share an annotation's id - and the re-insert would not bring it back.
     """
+    if not chunk_type:
+        # `--type all` used to arrive here as None, and the clause below was
+        # simply omitted — reproducing the bare `id IN (...)` predicate that
+        # 6cc57d7 removed, through the flag that most invites a corpus-wide
+        # clean-up (finding 1.11). `all` now expands to the concrete types and
+        # runs this path once per type, so no caller can reach it untyped.
+        raise ValueError(
+            "_batch_filter requires a concrete chunk_type: ids are only unique "
+            "per type, so an unqualified delete would remove rows of other "
+            "types that share an id. Use resolve_chunk_types() to expand 'all'."
+        )
     id_list = ", ".join(f"'{_sql_quote(i)}'" for i in batch)
-    predicate = f"id IN ({id_list})"
-    if chunk_type:
-        predicate += f" AND chunk_type = '{_sql_quote(chunk_type)}'"
-    return predicate
+    return (
+        f"id IN ({id_list}) AND chunk_type = '{_sql_quote(chunk_type)}'"
+    )
+
+
+def resolve_chunk_types(requested: str) -> list[str]:
+    """Expand a ``--type`` value into the concrete types to clean.
+
+    ``all`` becomes every known chunk type rather than "no filter" — the
+    difference between running the guarded path N times and running an
+    unguarded path once (finding 1.11).
+    """
+    if (requested or "").lower() != "all":
+        return [requested]
+    return [
+        ChunkType.CONTENT,
+        ChunkType.CHILD,
+        ChunkType.PARENT,
+        ChunkType.EXCHANGE,
+        ChunkType.CALIBRE_COMMENT,
+        ChunkType.ANNOTATION,
+        ChunkType.PHASE1_METADATA,
+    ]
 
 
 def backup_rows(table, dup_ids: list[str], backup_path: Path, batch_size: int,
@@ -379,13 +410,34 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_sigint)
 
     db_path = Path(args.db_path) if args.db_path else Path(get_rag_db_path())
-    chunk_type = None if args.type.lower() == "all" else args.type
 
     print(f"Database: {db_path}")
     db = lancedb.connect(str(db_path))
     table = db.open_table("chunks")
 
-    scope = chunk_type or 'all types'
+    # 'all' runs the guarded per-type path once per type rather than one
+    # unqualified pass (finding 1.11): ids are unique per chunk_type, so a
+    # type-blind delete removes rows of other types that share an id.
+    types = resolve_chunk_types(args.type)
+    if len(types) > 1:
+        print(f"Cleaning {len(types)} chunk types in turn: {', '.join(types)}")
+    exit_code = 0
+    for chunk_type in types:
+        if _interrupted:
+            print("\nInterrupted - remaining types not processed.")
+            break
+        if len(types) > 1:
+            print(f"\n{'=' * 62}")
+            print(f"  chunk_type: {chunk_type}")
+            print("=" * 62)
+        rc = _run_for_type(table, chunk_type, args, db_path)
+        exit_code = rc or exit_code
+    return exit_code
+
+
+def _run_for_type(table, chunk_type: str, args, db_path: Path) -> int:
+    """Plan and apply the dedupe for exactly one chunk_type."""
+    scope = chunk_type
     if args.book:
         scope += f", book {args.book}"
     print(f"Reading rows ({scope}) ...")
@@ -433,8 +485,8 @@ def main() -> int:
 
     backup_dir = Path(args.backup_dir) if args.backup_dir else db_path.parent / "backups"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = backup_dir / f"dedupe_{chunk_type or 'all'}_{stamp}.parquet"
-    checkpoint = db_path.parent / f".dedupe_{chunk_type or 'all'}_checkpoint.json"
+    backup_path = backup_dir / f"dedupe_{chunk_type}_{stamp}.parquet"
+    checkpoint = db_path.parent / f".dedupe_{chunk_type}_checkpoint.json"
 
     with routine_lock("dedupe_chunks", wait_s=1800) as acquired:
         if not acquired:

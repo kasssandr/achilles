@@ -772,13 +772,33 @@ class LanceDBStore:
         New columns (like metadata_hash) will be added when new chunks are inserted
         via add_chunks(), but cannot be added via update() alone.
 
+        ``text`` and ``vector`` are refused (finding 1.7b). Both are columns in
+        the schema, so the filter below would have written them like any other
+        field — the only thing preventing a text update without a matching
+        embedding was that no caller had written that line yet. The result
+        would be a row whose vector describes text it no longer contains: no
+        query can detect it, and no scan repairs it, because every hash the
+        watchdog compares stays unchanged.
+
         Args:
             book_id: The book_id to update
             updates: Dict of field names to new values (e.g. {'tags': 'new,tags', 'metadata_hash': 'abc123'})
 
         Returns:
             Number of chunks updated (approximate)
+
+        Raises:
+            ValueError: if ``updates`` contains ``text`` or ``vector``.
         """
+        forbidden = {'text', 'vector'} & set(updates)
+        if forbidden:
+            raise ValueError(
+                f"update_metadata_fields refuses {sorted(forbidden)}: changing "
+                f"chunk text or its vector here would leave the two describing "
+                f"different things. Re-embed the book instead "
+                f"(index_book(force=True) or the prepare/embed path)."
+            )
+
         if self.table is None:
             return 0
 

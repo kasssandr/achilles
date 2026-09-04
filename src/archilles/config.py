@@ -61,13 +61,86 @@ def get_library_path(*, required: bool = True) -> Path | None:
     sys.exit(1)
 
 
+# Every key a per-library ``.archilles/config.json`` may carry. Anything else
+# is reported once per file (finding 1.14): a key the code never reads is
+# silently ignored, and the live Calibre library carried ``db_path`` — meant as
+# ``rag_db_path`` — for months. It did no harm only because its value happened
+# to equal the fallback; pointing it at another drive would have moved nothing
+# and warned about nothing.
+_KNOWN_LIBRARY_CONFIG_KEYS: frozenset[str] = frozenset({
+    "adapter",
+    "citation",
+    "duplicate_tag",
+    "embedder",
+    "enable_reranking",
+    "exclude_patterns",
+    "excluded_tags",
+    "languages",
+    "library_path",
+    "linked_attachment_base",
+    "mode",
+    "name",
+    "rag_db_path",
+    "reranker_device",
+})
+
+# Near-misses worth naming outright rather than leaving to the reader.
+_LIBRARY_CONFIG_ALIASES: dict[str, str] = {
+    "db_path": "rag_db_path",
+    "database_path": "rag_db_path",
+    "exclude_tags": "excluded_tags",
+    "language": "languages",
+    "rerank_device": "reranker_device",
+}
+
+# Keys that look meaningful but are read from somewhere else entirely, so the
+# warning can say where instead of just "unknown". `instance_name` sits in one
+# live library config and has never had an effect: the source name comes from
+# the master config's ``sources[].name``.
+_LIBRARY_CONFIG_ELSEWHERE: dict[str, str] = {
+    "instance_name": "the master config's sources[].name",
+    "default_source": "the master config",
+    "sources": "the master config",
+    "transport": "the master config",
+    "preload_models": "the master config",
+}
+
+# Files already reported, so a warning appears once per run rather than once
+# per getter — get_rag_db_path, get_excluded_tags and the rest all read the
+# same file, several times per scan.
+_reported_unknown_keys: set[str] = set()
+
+
+def _warn_about_unknown_keys(config_path: Path, config: dict) -> None:
+    """Report config keys the code never reads. Once per file, never fatal."""
+    unknown = sorted(set(config) - _KNOWN_LIBRARY_CONFIG_KEYS)
+    if not unknown:
+        return
+    marker = str(config_path)
+    if marker in _reported_unknown_keys:
+        return
+    _reported_unknown_keys.add(marker)
+    for key in unknown:
+        meant = _LIBRARY_CONFIG_ALIASES.get(key)
+        elsewhere = _LIBRARY_CONFIG_ELSEWHERE.get(key)
+        if meant:
+            hint = f" — did you mean {meant!r}?"
+        elif elsewhere:
+            hint = f" — this setting is read from {elsewhere}"
+        else:
+            hint = ""
+        logger.warning(
+            "Unknown key %r in %s is ignored%s", key, config_path, hint,
+        )
+
+
 def _read_library_config(library_path: Path) -> dict:
     """Read ``<library>/.archilles/config.json`` as a dict.
 
     One shared reader for all per-library config getters so their error
     policy cannot drift: a missing, unparseable or non-object file yields
     ``{}`` (with a warning for a broken file), and each getter falls back
-    to its default.
+    to its default. Keys the code never reads are reported once per file.
     """
     config_path = library_path / ".archilles" / "config.json"
     if not config_path.exists():
@@ -78,7 +151,10 @@ def _read_library_config(library_path: Path) -> dict:
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Cannot read %s (using defaults): %s", config_path, exc)
         return {}
-    return config if isinstance(config, dict) else {}
+    if not isinstance(config, dict):
+        return {}
+    _warn_about_unknown_keys(config_path, config)
+    return config
 
 
 def get_rag_db_path(library_path: Path | None = None) -> str:

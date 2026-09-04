@@ -14,6 +14,7 @@ import lancedb
 import numpy as np
 
 from src.archilles.constants import ChunkType, SectionType
+from src.archilles.pipeline_version import PIPELINE_VERSION
 
 try:
     from lancedb.rerankers import RRFReranker
@@ -92,6 +93,10 @@ class LanceDBStore:
         "indexed_at": str,
         "metadata_hash": str,  # Hash of Calibre metadata for change detection
 
+        # Generation of the pipeline that wrote this row. '' = written before
+        # the marker existed; see src/archilles/pipeline_version.py.
+        "pipeline_version": str,
+
         # Hardware-Tiers-V2 §12: 1 = provisionally light (mode=full-external,
         # waiting for an external hierarchical re-embed), 0 = final. Lets the
         # discovery path tell "provisional light" from "deliberately light".
@@ -127,6 +132,9 @@ class LanceDBStore:
         "annotation_hash": "''",
         "source_id": "''",
         "pending_external": "0",
+        # Rows written before the marker existed keep '' — that is the signal,
+        # not a gap: '' plus indexed_at locates the pre-marker generations.
+        "pipeline_version": "''",
     }
 
     def _ensure_table(self):
@@ -357,6 +365,11 @@ class LanceDBStore:
 
                 # Hardware-Tiers-V2 §12: provisional-light marker (default: final)
                 "pending_external": chunk.get("pending_external") or 0,
+
+                # Which generation of the pipeline composed this row (1.7a).
+                # Not taken from the chunk dict: a caller that could pass its
+                # own value could claim a generation it did not produce.
+                "pipeline_version": PIPELINE_VERSION,
             }
 
             records.append(record)
@@ -772,6 +785,11 @@ class LanceDBStore:
         New columns (like metadata_hash) will be added when new chunks are inserted
         via add_chunks(), but cannot be added via update() alone.
 
+        ``pipeline_version`` is refused for the same reason in a different
+        direction: it is a claim about who wrote a row, and a marker that any
+        caller may overwrite is a docstring again (finding 1.7a). It is set by
+        ``add_chunks`` and by nothing else.
+
         ``text`` and ``vector`` are refused (finding 1.7b). Both are columns in
         the schema, so the filter below would have written them like any other
         field — the only thing preventing a text update without a matching
@@ -788,7 +806,8 @@ class LanceDBStore:
             Number of chunks updated (approximate)
 
         Raises:
-            ValueError: if ``updates`` contains ``text`` or ``vector``.
+            ValueError: if ``updates`` contains ``text``, ``vector`` or
+                ``pipeline_version``.
         """
         forbidden = {'text', 'vector'} & set(updates)
         if forbidden:
@@ -797,6 +816,12 @@ class LanceDBStore:
                 f"chunk text or its vector here would leave the two describing "
                 f"different things. Re-embed the book instead "
                 f"(index_book(force=True) or the prepare/embed path)."
+            )
+        if 'pipeline_version' in updates:
+            raise ValueError(
+                "update_metadata_fields refuses 'pipeline_version': it records "
+                "which generation of the pipeline composed a row, and a run "
+                "that did not compose it cannot say. add_chunks sets it."
             )
 
         if self.table is None:

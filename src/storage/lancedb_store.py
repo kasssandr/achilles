@@ -902,6 +902,58 @@ class LanceDBStore:
         except Exception:
             return False
 
+    def get_book_ids_without_parent_chunks(self) -> set[str]:
+        """Return book_ids that have flat content chunks but no PARENT/CHILD.
+
+        The catch-up counterpart to :meth:`get_pending_external_book_ids`
+        (finding 1.2).  The ``pending_external`` marker is only written under
+        ``mode: full-external``; a book indexed under ``light`` carries no
+        marker at all, yet still waits for a hierarchical re-embed.  What the
+        index does record either way is the shape of its chunks, so a book
+        with ``content`` chunks and no hierarchical ones is exactly such a
+        candidate.
+
+        Books whose only chunks are metadata stubs or annotations are not
+        returned — they hold no fulltext to re-embed.  Callers must gate this
+        on :meth:`has_parent_chunks`, or a deliberately flat library nominates
+        its entire corpus.
+
+        Uses column projection — reads only ``book_id`` + ``chunk_type``,
+        never the text/vector columns.
+        """
+        if self.table is None:
+            return set()
+
+        columns = ['book_id', 'chunk_type']
+        try:
+            lance_dataset = self.table.to_lance()
+            existing = set(lance_dataset.schema.names)
+            if not {'book_id', 'chunk_type'} <= existing:
+                return set()
+            rows = lance_dataset.to_table(columns=columns).to_pylist()
+        except Exception:
+            try:
+                df = self.table.search().select(columns).limit(10_000_000).to_pandas()
+                if 'chunk_type' not in df.columns or 'book_id' not in df.columns:
+                    return set()
+                rows = df.to_dict(orient='records')
+            except Exception:
+                return set()
+
+        flat: set[str] = set()
+        hierarchical: set[str] = set()
+        for row in rows:
+            bid = row.get('book_id')
+            if not bid:
+                continue
+            chunk_type = row.get('chunk_type')
+            if chunk_type == ChunkType.CONTENT:
+                flat.add(str(bid))
+            elif chunk_type in (ChunkType.PARENT, ChunkType.CHILD):
+                hierarchical.add(str(bid))
+
+        return flat - hierarchical
+
     def delete_by_calibre_id(self, calibre_id: int) -> int:
         """Delete all chunks for a specific Calibre ID."""
         return self._delete_where(f"calibre_id = {calibre_id}")

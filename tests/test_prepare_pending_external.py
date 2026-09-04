@@ -27,8 +27,13 @@ class TestParserFlag:
 
 class TestDiscovery:
     def test_resolves_numeric_pending_ids_sorted(self, monkeypatch):
+        # Flat index: the marker is the only source of truth here, which is
+        # what this test is about (the union is covered by finding 1.2's own
+        # tests in test_external_catchup_discovery.py).
         store = SimpleNamespace(
-            get_pending_external_book_ids=lambda: {"7", "3", "folder:9"}
+            get_pending_external_book_ids=lambda: {"7", "3", "folder:9"},
+            has_parent_chunks=lambda: False,
+            get_book_ids_without_parent_chunks=lambda: set(),
         )
         rag = SimpleNamespace(store=store)
         seen = {}
@@ -48,7 +53,11 @@ class TestDiscovery:
 
     def test_empty_pending_returns_empty_without_db_call(self, monkeypatch):
         rag = SimpleNamespace(
-            store=SimpleNamespace(get_pending_external_book_ids=lambda: set())
+            store=SimpleNamespace(
+                get_pending_external_book_ids=lambda: set(),
+                has_parent_chunks=lambda: False,
+                get_book_ids_without_parent_chunks=lambda: set(),
+            )
         )
         called = []
         monkeypatch.setattr(
@@ -63,7 +72,9 @@ class TestDiscovery:
         (Zotero keys) are resolved via the adapter instead of being dropped."""
         rag = SimpleNamespace(
             store=SimpleNamespace(
-                get_pending_external_book_ids=lambda: {"ZK1", "ZK3"}
+                get_pending_external_book_ids=lambda: {"ZK1", "ZK3"},
+                has_parent_chunks=lambda: False,
+                get_book_ids_without_parent_chunks=lambda: set(),
             )
         )
         adapter = SimpleNamespace(adapter_type="zotero")

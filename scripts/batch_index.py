@@ -880,8 +880,29 @@ def discover_pending_external_books(rag, library_path: Path, adapter=None) -> Li
     Returns book dicts ready for batch_prepare; an empty list short-circuits.
     """
     pending = rag.store.get_pending_external_book_ids()
+
+    # Finding 1.2: the marker alone is not the truth. ``pending_external`` is
+    # written only under ``mode: full-external``; a title indexed under
+    # ``light`` carries no marker and would be invisible here, yet still waits
+    # for its hierarchical re-embed. The index knows it anyway — content
+    # chunks without PARENT/CHILD. Gate that term on the index actually
+    # holding hierarchical chunks, otherwise a deliberately flat library
+    # nominates its whole corpus for a metered run.
+    derived: set = set()
+    if rag.store.has_parent_chunks():
+        derived = rag.store.get_book_ids_without_parent_chunks() - pending
+        pending = pending | derived
+
     if not pending:
         return []
+
+    if derived:
+        # The two halves have very different provenance, and the derived one
+        # can be large. Say so before anything expensive starts.
+        print(f"  ℹ️  {len(pending)} book(s) awaiting external embedding: "
+              f"{len(pending) - len(derived)} marked pending_external, "
+              f"{len(derived)} derived from the index (content chunks, no "
+              f"PARENT/CHILD — indexed under a non-external mode).")
 
     use_adapter = adapter is not None and getattr(adapter, "adapter_type", "calibre") != "calibre"
     if use_adapter:
@@ -1879,9 +1900,9 @@ def main():
     if args.prepare_pending_external:
         books = discover_pending_external_books(rag, library_path, adapter=adapter)
         if not books:
-            print("✅ No books awaiting external embedding (pending_external is empty)")
+            print("✅ No books awaiting external embedding")
             return
-        print(f"🔎 {len(books)} book(s) awaiting external embedding (pending_external)")
+        print(f"🔎 {len(books)} book(s) awaiting external embedding")
         if args.output_dir == './prepared_chunks':
             print("  ℹ️  Using the default --output-dir. If this is shared with a large "
                   "corpus prepare run, consider a dedicated (smaller) directory for the "

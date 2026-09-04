@@ -329,6 +329,37 @@ def _refresh_search_indexes(rag, results: dict, dry_run: bool) -> None:
         logger.warning("Index refresh after watchdog run failed: %s", exc)
 
 
+def log_crash(log_file, exc: BaseException) -> None:
+    """Append a crashing scan's traceback to the library's watchdog.log.
+
+    ``scripts/run_routine.py`` deliberately leaves stderr on the real terminal
+    so tqdm renders in place, which means a traceback lives only in a console
+    window — and watchdog.log stays empty, because its summary is written
+    *after* the scan. On 2026-09-04 a Zotero run died on a locked database and
+    left nothing behind but ``EXIT=1`` and ``stats: {}``; diagnosing it needed a
+    live re-run (finding 1.16).
+
+    Best-effort by construction: a failure here must never replace the error it
+    is recording, so every problem writing the file is swallowed.
+    """
+    import traceback
+
+    try:
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(
+                f"\n{stamp} CRASH — scan aborted: "
+                f"{type(exc).__name__}: {exc}\n"
+            )
+            fh.write("".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ))
+    except Exception:
+        pass
+
+
 def _record_unindexable(
     results: dict,
     adapter,
@@ -367,6 +398,50 @@ def _record_unindexable(
         doc_id, title or "?", where, reason or "reason unknown",
         f" [{detail}]" if detail else "",
     )
+
+
+def _resolve_file_path_safely(
+    adapter,
+    doc_id: str,
+    title: str,
+    results: dict,
+    where: str,
+):
+    """``adapter.get_file_path`` that costs at most one book (finding 1.16).
+
+    On 2026-09-04 a Zotero run died here: the source database was locked by the
+    running Zotero app, ``get_file_path`` raised ``sqlite3.OperationalError``,
+    and the whole run went with it — after 21 minutes spent on a single book,
+    with no JSON dump and ``stats: {}`` in the history. One of the seven adapter
+    call sites had a try/except and this one did not.
+
+    The two failure modes are kept apart on purpose:
+
+    * **No file** — a resolvable question with a wrong answer (an unset config
+      key, a moved file). Counted as a skip, not an error, so the run's exit
+      code stays 0 (finding 1.15).
+    * **The lookup itself failed** — a lock, a corrupt database, a permission
+      problem. That *is* an error: it says nothing about the item, only that we
+      could not ask. It is recorded in ``results['errors']`` so the run exits
+      non-zero and the item is retried next time.
+    """
+    try:
+        file_path = adapter.get_file_path(doc_id)
+    except Exception as exc:
+        logger.error(
+            "Could not resolve a file for %s (%s) in %s: %s",
+            doc_id, title or "?", where, exc,
+        )
+        results.setdefault('errors', []).append({
+            'doc_id': doc_id,
+            'error': f"file lookup failed: {exc}",
+        })
+        return None
+
+    if not file_path:
+        _record_unindexable(results, adapter, doc_id, title, where)
+        return None
+    return file_path
 
 
 def summarise_unindexable(entries: list[dict]) -> str:
@@ -1163,7 +1238,16 @@ def _zotero_metadata_for_scan(library_path: Path) -> dict[str, dict[str, Any]]:
     excluded = ",".join(str(t) for t in _ZOTERO_EXCLUDED_TYPE_IDS)
     # Live DB: no immutable (Zotero may be writing concurrently) — mode=ro reads
     # a consistent WAL snapshot; busy_timeout absorbs a brief writer lock (4.4).
-    conn = connect_readonly(db_path, row_factory=sqlite3.Row)
+    #
+    # Deliberately SHORT here, against the 60 s default (finding 1.16): at scan
+    # start nothing is invested yet, and the common cause is simply that Zotero
+    # is open — which it stays. Measured 2026-09-04: waiting 60 s changed
+    # nothing except making the run take 88 s to report `db_locked`. The long
+    # timeout is for locks that arrive *mid-run*, where an abort throws away
+    # twenty minutes of work per book.
+    conn = connect_readonly(
+        db_path, row_factory=sqlite3.Row, busy_timeout_ms=5_000,
+    )
     try:
         items = conn.execute(f"""
             SELECT itemID, key, dateModified
@@ -1492,11 +1576,10 @@ class ZoteroWatchdogScanner:
                     print(f"\n⏸️  Shutdown requested — phase 2 stopped after {i-1}/{total_p2} items.")
                     break
                 data = zotero_items.get(key, {})
-                file_path = adapter.get_file_path(key)
+                file_path = _resolve_file_path_safely(
+                    adapter, key, data.get('title', ''), results, "phase 2",
+                )
                 if not file_path:
-                    _record_unindexable(
-                        results, adapter, key, data.get('title', ''), "phase 2",
-                    )
                     continue
                 print(f"\n[{i}/{total_p2}] {data.get('title', key)}")
                 try:
@@ -1551,12 +1634,10 @@ class ZoteroWatchdogScanner:
                         print(f"\n⏸️  Shutdown requested — phase 3 stopped after {j-1}/{total_p3} items.")
                         break
                     key = entry['doc_id']
-                    file_path = adapter.get_file_path(key)
+                    file_path = _resolve_file_path_safely(
+                        adapter, key, entry.get('title', ''), results, "phase 3",
+                    )
                     if not file_path:
-                        # Counted and explained, not skipped in silence (1.15).
-                        _record_unindexable(
-                            results, adapter, key, entry.get('title', ''), "phase 3",
-                        )
                         continue
                     print(f"\n[{j}/{total_p3}] {entry['title']}")
                     try:

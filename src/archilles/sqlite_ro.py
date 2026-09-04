@@ -24,7 +24,7 @@ def connect_readonly(
     db_path: Union[str, Path],
     *,
     immutable: bool = False,
-    busy_timeout_ms: int = 5000,
+    busy_timeout_ms: int = 60_000,
     row_factory: Optional[Callable] = None,
 ) -> sqlite3.Connection:
     """Oeffnet ``db_path`` schreibgeschuetzt (``mode=ro``).
@@ -34,9 +34,18 @@ def connect_readonly(
         immutable: zusaetzlich ``immutable=1`` (nur fuer unveraenderliche DBs;
             bei Live-DBs weglassen -- sonst ignoriert SQLite das WAL und liest
             veraltete oder halb-geschriebene Seiten, Befund 4.4).
-        busy_timeout_ms: Wartezeit auf einen kurzzeitigen Lock (z. B. waehrend
-            ein paralleler Zotero/Calibre-Prozess schreibt), bevor
-            ``SQLITE_BUSY`` geworfen wird. 0 schaltet das Warten ab.
+        busy_timeout_ms: Wartezeit auf einen Lock, bevor ``SQLITE_BUSY``
+            geworfen wird. 0 schaltet das Warten ab.
+
+            60 s, nicht 5 (Befund 1.16): 5 s war auf "einen kurzzeitigen
+            Schreib-Lock" ausgelegt, aber ein Zotero-Sync haelt laenger. Am
+            2026-09-04 starb ein Routinelauf genau daran -- nach 21 Minuten in
+            *einem* Buch (1160 s Embedding auf der T1000), also mit sehr langer
+            Exposition gegenueber einer Datenbank, die der Nutzer parallel
+            benutzt. Warten kostet hier nichts: der Aufrufer laeuft ohnehin
+            minutenlang, waehrend ein Abbruch den ganzen Lauf verliert.
+            Interaktive Pfade, die schnell scheitern wollen, setzen den Wert
+            explizit herunter.
         row_factory: optionale ``row_factory`` (z. B. ``sqlite3.Row``).
 
     Returns:

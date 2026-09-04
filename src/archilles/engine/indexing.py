@@ -432,6 +432,21 @@ class Indexer:
             try:
                 adapter_hash = adapter.compute_metadata_hash(str(book_id))
             except Exception as exc:
+                # Falling back is only safe where both shapes agree. For Calibre
+                # they do — CalibreAdapter delegates to the same canonical
+                # function, measured 120/120 identical on the live library. For
+                # every other source they do not: Zotero hashes
+                # title/authors/tags/abstract/date, the fallback hashes
+                # comments/tags/title/author/publisher. Storing the wrong shape
+                # makes the scanner see `metadata_changed` on every later scan —
+                # the reindex storm this method's docstring warns about.
+                # Observed live on 2026-09-04 for three Zotero items when the
+                # database was locked mid-run (finding 1.16).
+                adapter_type = getattr(adapter, "adapter_type", "calibre")
+                if adapter_type != "calibre":
+                    print(f"  ⚠️  adapter metadata hash failed for {book_id}: {exc} — "
+                          f"storing no hash rather than one of the wrong shape.")
+                    return ""
                 print(f"  ⚠️  adapter metadata hash failed for {book_id}: {exc} — "
                       f"falling back to extracted-metadata hash.")
                 adapter_hash = ""

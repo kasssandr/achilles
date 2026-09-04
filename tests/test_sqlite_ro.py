@@ -79,9 +79,12 @@ class TestConnectReadonly:
 
 class TestBusyTimeout:
     def test_default_busy_timeout_is_set(self, db):
+        """60 s, not 5 (finding 1.16): a Zotero sync holds its write lock far
+        longer than "a brief writer lock", and a run that waits loses nothing
+        while a run that gives up loses everything."""
         conn = connect_readonly(db)
         try:
-            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60_000
         finally:
             conn.close()
 

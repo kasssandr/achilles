@@ -45,7 +45,11 @@ if hasattr(sys.stderr, "buffer"):
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.archilles.config import get_library_path, get_rag_db_path
-from src.archilles.watchdog import WatchdogScanner, ZoteroWatchdogScanner
+from src.archilles.watchdog import (
+    WatchdogScanner,
+    ZoteroWatchdogScanner,
+    log_crash,
+)
 
 
 def _resolve_paths() -> tuple[Path, str, Path]:
@@ -314,7 +318,18 @@ def main() -> None:
             print("WARNING: --rating is ignored for Zotero (Calibre-only; "
                   "Zotero has no rating field).", file=sys.stderr)
 
-    results = scanner.scan(**scan_kwargs)
+    try:
+        results = scanner.scan(**scan_kwargs)
+    except Exception as exc:
+        # Whatever kills a scan must leave a trace where someone looks for it
+        # (finding 1.16). run_routine.py deliberately keeps stderr on the real
+        # terminal so tqdm renders in place, which means a traceback lives only
+        # in a console window — and watchdog.log stays empty, because the
+        # summary is written *after* the scan. On 2026-09-04 a run died on a
+        # locked Zotero database and left nothing behind but "EXIT=1" and
+        # "stats: {}"; diagnosing it needed a live re-run.
+        log_crash(archilles_dir / "watchdog.log", exc)
+        raise
 
     _print_results(results, json_mode=args.json_mode)
 

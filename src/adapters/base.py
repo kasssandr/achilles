@@ -114,6 +114,14 @@ class SourceAdapter(ABC):
 
     # ── Optional (stubs) ────────────────────────────────────────
 
+    #: Whether the most recent library scan was known to be incomplete — an
+    #: I/O or permission error the adapter could see but not resolve. Adapters
+    #: that cannot detect a partial read leave this False, which is what every
+    #: caller assumed before it existed. The orphan-deletion paths refuse when
+    #: it is True: a book missing from a partial scan has not been shown to be
+    #: gone (review 1.1b, see ``src/archilles/orphan_guard.py``).
+    scan_incomplete: bool = False
+
     def watch_inbox(self, callback=None) -> None:
         """Watch the inbox/ subdirectory for new files.
 

@@ -42,6 +42,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.archilles import runtime_lock
 from src.archilles.config import load_master_config
+from src.archilles.orphan_guard import ORPHAN_COUNT_LIMIT
 
 
 SMTP_HOST = "smtp.gmail.com"
@@ -147,6 +148,17 @@ def _format_source_block(name: str, adapter: str, library: Path, rows: list[dict
             f"    Indexiert: {agg('indexed')}  |  "
             f"übersprungen: {agg('skipped')}  |  "
             f"fehlgeschlagen: {agg('failed')}"
+        )
+
+    # Deletions, always — at any count, including zero (review 1.10c). This is
+    # the only report in which a wrong orphan cleanup would surface, and it
+    # runs weekly; a deletion nobody mentions is a deletion nobody notices.
+    orphans = sum((r.get("stats", {}) or {}).get("orphans_removed", 0) or 0 for r in rows)
+    mark = "  ⚠️  ungewöhnlich viele — bitte prüfen" if orphans > ORPHAN_COUNT_LIMIT else ""
+    lines.append(f"    Aus dem Index entfernt (Waisen): {orphans}{mark}")
+    if orphans:
+        lines.append(
+            "      Rollback: <library>/.archilles/backups/orphans_*.parquet"
         )
 
     last = max(rows, key=lambda r: r.get("timestamp", ""))

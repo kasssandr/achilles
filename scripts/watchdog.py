@@ -238,6 +238,12 @@ def main() -> None:
         help='Cap on new books indexed per run (default: no limit). '
              'Use e.g. --max-new 20 in daily routines to drain the backlog gradually.'
     )
+    parser.add_argument(
+        '--allow-large-orphan-cleanup', action='store_true',
+        help='Authorise an orphan deletion above the safety bound (>2%% of the index '
+             'AND >25 books). For a deliberate bulk deletion; never use it in a '
+             'scheduled run, and it does not override a scan that reported errors.'
+    )
     args = parser.parse_args()
 
     library_path, db_path, archilles_dir = _resolve_paths()
@@ -288,6 +294,7 @@ def main() -> None:
         'dry_run': args.dry_run,
         'queue_new': args.queue_new,
         'index_new': args.index_new,
+        'allow_large_orphan_cleanup': args.allow_large_orphan_cleanup,
     }
     if scanner_type == "calibre":
         scan_kwargs['index_metadata_only'] = getattr(args, 'index_metadata_only', False)

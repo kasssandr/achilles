@@ -11,9 +11,25 @@ snapshotted a half-written database mid-run, it only ever ran from
 batch_index (never from the scheduled routines, so it silently stopped
 producing backups when those took over), and the copies landed on the same
 drive as the database — no protection against disk loss, but a real risk of
-filling the disk. Rollback now comes from LanceDB's own version retention
-(see LanceDBStore.optimize_indexes), and the database is reproducible from
-Calibre plus prepared_chunks anyway.
+filling the disk.
+
+What protects the index now, in order of what each actually covers:
+
+* **Deletions** — the orphan-cleanup paths write every doomed row, vectors
+  included, to ``<db>/../backups/orphans_<stamp>.parquet`` *before* deleting
+  (src/archilles/orphan_guard.py). This is the rollback that matters, because
+  deletion is the only irreversible operation the routines perform, and the
+  file stays until someone removes it.
+* **Accidental mass deletion** — a proportionality bound refuses a cleanup
+  above 2% *and* 25 books, and any scan that reported an I/O error blocks the
+  cleanup outright.
+* **Recent writes** — LanceDB keeps superseded table versions for **two days**
+  (LanceDBStore.optimize_indexes; cut from seven in e8a5081 because one copy of
+  this corpus is ~16 GB). Two days is shorter than the weekly status mail, so
+  it covers a same-week mistake noticed quickly — it is not a deletion
+  rollback, which is why the Parquet files exist.
+* **Total loss** — the database is reproducible from Calibre plus
+  prepared_chunks. Slow, but complete.
 """
 
 import sys

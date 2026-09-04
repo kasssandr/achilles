@@ -248,11 +248,22 @@ class FolderAdapter(SourceAdapter):
         )
 
     def _scan(self) -> dict[str, DocumentMetadata]:
-        """Recursively scan library for supported files. Returns rel_posix → metadata."""
+        """Recursively scan library for supported files. Returns rel_posix → metadata.
+
+        ``os.walk`` swallows errors silently by default: a locked, syncing or
+        unreadable subtree yields a partial — and non-empty — tree, which the
+        orphan-cleanup path would read as "those documents were deleted".
+        The scan still returns what it found (indexing a partial library is
+        fine), but records that it was partial in ``scan_incomplete`` so the
+        deletion paths can refuse it (review 1.1b).
+        """
         result = {}
         excluded = 0
+        walk_errors: list[OSError] = []
         ignored_dirs = self._ignored_dirs
-        for dirpath, dirnames, filenames in os.walk(self._library_path):
+        for dirpath, dirnames, filenames in os.walk(
+            self._library_path, onerror=walk_errors.append
+        ):
             # Prune ignored directories in-place
             dirnames[:] = [d for d in dirnames if d not in ignored_dirs]
 
@@ -267,6 +278,19 @@ class FolderAdapter(SourceAdapter):
                 result[rel_posix] = self._build_metadata(fp)
         if excluded:
             logger.info(f"Excluded {excluded} file(s) by exclude_patterns")
+
+        self.scan_incomplete = bool(walk_errors)
+        if walk_errors:
+            for err in walk_errors[:5]:
+                logger.warning(
+                    "Scan of %s could not be completed: %s (%s)",
+                    self._library_path, err.strerror or err, getattr(err, "filename", "?"),
+                )
+            logger.warning(
+                "%d directory error(s) during scan of %s — this scan must not be "
+                "used as a basis for deleting index entries",
+                len(walk_errors), self._library_path,
+            )
         return result
 
     def _ensure_cache(self) -> dict[str, DocumentMetadata]:

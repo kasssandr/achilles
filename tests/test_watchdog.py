@@ -1094,7 +1094,7 @@ class TestOrphanCleanup:
         assert results['orphans_removed'] == 0
 
     def test_deleted_book_removed_from_index(
-        self, calibre_library: Path, scanner_factory,
+        self, tmp_path: Path, calibre_library: Path, scanner_factory,
     ):
         _add_book(calibre_library, 1, "Still here",
                   authors=["A"], with_file="x.epub")
@@ -1103,14 +1103,38 @@ class TestOrphanCleanup:
             99: {'book_id': '99', 'metadata_hash': 'h', 'annotation_hash': ''},
         })
 
-        with patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls:
+        with patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls, \
+             patch("src.archilles.watchdog.backup_orphan_chunks") as mock_backup:
             mock_store_cls.return_value.delete_by_book_id.return_value = 7
+            mock_backup.return_value = tmp_path / "backups" / "orphans.parquet"
             results = scanner.scan(dry_run=False, queue_new=False)
 
         mock_store_cls.return_value.delete_by_book_id.assert_called_once_with('99')
+        mock_backup.assert_called_once()
+        assert results['orphan_backup_path'].endswith("orphans.parquet")
         assert results['orphans_found'] == ['99']
         assert results['orphans_removed'] == 1
         assert not results['errors']
+
+    def test_deletion_is_refused_when_the_backup_fails(
+        self, calibre_library: Path, scanner_factory,
+    ):
+        """No rollback file, no deletion: LanceDB's two-day version window is
+        shorter than the weekly mail that would surface the mistake."""
+        _add_book(calibre_library, 1, "Still here",
+                  authors=["A"], with_file="x.epub")
+        scanner = scanner_factory(indexed_hashes={
+            1:  {'book_id': '1', 'metadata_hash': '', 'annotation_hash': ''},
+            99: {'book_id': '99', 'metadata_hash': 'h', 'annotation_hash': ''},
+        })
+
+        with patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls, \
+             patch("src.archilles.watchdog.backup_orphan_chunks", return_value=None):
+            results = scanner.scan(dry_run=False, queue_new=False)
+
+        mock_store_cls.return_value.delete_by_book_id.assert_not_called()
+        assert results['orphans_removed'] == 0
+        assert results['orphan_cleanup_refused'] is True
 
     def test_empty_library_snapshot_skips_cleanup(
         self, calibre_library: Path, scanner_factory,
@@ -1145,7 +1169,7 @@ class TestOrphanCleanup:
         assert results['orphans_found'] == []
 
     def test_deletion_failure_is_recorded_not_fatal(
-        self, calibre_library: Path, scanner_factory,
+        self, tmp_path: Path, calibre_library: Path, scanner_factory,
     ):
         _add_book(calibre_library, 1, "Still here",
                   authors=["A"], with_file="x.epub")
@@ -1154,9 +1178,11 @@ class TestOrphanCleanup:
             99: {'book_id': '99', 'metadata_hash': 'h', 'annotation_hash': ''},
         })
 
-        with patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls:
+        with patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls, \
+             patch("src.archilles.watchdog.backup_orphan_chunks") as mock_backup:
             mock_store_cls.return_value.delete_by_book_id.side_effect = \
                 RuntimeError("commit conflict")
+            mock_backup.return_value = tmp_path / "backups" / "orphans.parquet"
             results = scanner.scan(dry_run=False, queue_new=False)
 
         assert results['orphans_removed'] == 0

@@ -93,6 +93,12 @@ from src.archilles.hardware import detect_hardware
 from src.archilles.profiles import get_profile, list_profiles
 from src.archilles.recipe import IndexRecipe, default_recipe
 from src.archilles.indexer import IndexingCheckpoint
+from src.archilles.orphan_guard import (
+    ORPHAN_COUNT_LIMIT,
+    ORPHAN_SHARE_LIMIT,
+    backup_orphan_chunks,
+    check_orphan_bound,
+)
 from src.archilles.sqlite_ro import connect_readonly
 
 # Preferred book formats in order of priority — canonical list in constants.py
@@ -741,6 +747,7 @@ def cleanup_orphans(
     library_path: Path,
     dry_run: bool = False,
     adapter=None,
+    allow_large: bool = False,
 ) -> Dict[str, Any]:
     """
     Remove LanceDB entries for books that no longer exist in the library.
@@ -752,14 +759,24 @@ def cleanup_orphans(
     non-Calibre backends (Folder, Obsidian, Zotero) are handled correctly.
     Falls back to direct SQLite access for legacy Calibre-only setups.
 
+    Guarded, because this is the path the Lab routine runs daily, unattended
+    and ``--non-interactive`` (review 1.1): the orphan set must pass
+    ``check_orphan_bound``, an adapter that reports a partial scan blocks the
+    deletion outright, and the doomed rows are written to Parquet before the
+    delete — LanceDB's two-day version retention is shorter than the weekly
+    mail that would surface a wrong deletion.
+
     Args:
         rag: Initialized ArchillesRAG instance
         library_path: Path to the library directory
         dry_run: If True, report orphans without deleting anything
         adapter: SourceAdapter instance (preferred over direct DB access)
+        allow_large: Operator states an oversized deletion is intended
+            (``--allow-large-orphan-cleanup``). Never overrides a failed scan.
 
     Returns:
-        Dict with 'orphans_found' and 'orphans_removed' counts.
+        Dict with 'orphans_found', 'orphans_removed', 'bound' and, when rows
+        were written, 'backup_path'.
     """
     print("\n🔍 Scanning for orphaned index entries...")
 
@@ -791,18 +808,61 @@ def cleanup_orphans(
         author = chunks[0].get('author', '?') if chunks else '?'
         print(f"      [{book_id}] {author}: {title}")
 
+    bound = check_orphan_bound(
+        orphan_count=len(orphan_ids),
+        indexed_count=len(indexed_ids),
+        allow_large=allow_large,
+        scan_incomplete=bool(getattr(adapter, 'scan_incomplete', False)),
+    )
+    if not bound.allowed:
+        print(f"\n   ⛔ {bound.reason}")
+        print("      Nothing was deleted. The books listed above stay in the index.")
+        return {
+            'orphans_found': len(orphan_ids),
+            'orphans_removed': 0,
+            'refused': True,
+            'bound': bound.as_dict(),
+        }
+
     if dry_run:
         print(f"\n   ℹ️  DRY RUN — no deletions performed")
-        return {'orphans_found': len(orphan_ids), 'orphans_removed': 0}
+        return {
+            'orphans_found': len(orphan_ids),
+            'orphans_removed': 0,
+            'bound': bound.as_dict(),
+        }
+
+    ordered = sorted(orphan_ids, key=lambda x: x.zfill(20))
+
+    # Before the delete, never after: LanceDB keeps the superseded version for
+    # two days, the weekly status mail is what would make a wrong deletion
+    # visible, and the rows themselves cost megabytes.
+    backup_dir = Path(rag.store.db_path).parent / "backups"
+    backup_path = backup_orphan_chunks(rag.store, ordered, backup_dir)
+    if backup_path is None:
+        print("\n   ⛔ Could not back up the orphaned chunks — refusing to delete.")
+        return {
+            'orphans_found': len(orphan_ids),
+            'orphans_removed': 0,
+            'refused': True,
+            'bound': bound.as_dict(),
+        }
+    print(f"\n   💾 Backed up orphaned chunks → {backup_path}")
 
     removed = 0
-    for book_id in sorted(orphan_ids, key=lambda x: x.zfill(20)):
+    for book_id in ordered:
         deleted = rag.store.delete_by_book_id(book_id)
         print(f"   🗑️  Deleted {deleted} chunks for book_id={book_id}")
         removed += 1
 
     print(f"\n   ✅ Cleanup complete: {removed} orphaned book(s) removed from index")
-    return {'orphans_found': len(orphan_ids), 'orphans_removed': removed}
+    print(f"      Rollback: {backup_path}")
+    return {
+        'orphans_found': len(orphan_ids),
+        'orphans_removed': removed,
+        'bound': bound.as_dict(),
+        'backup_path': str(backup_path),
+    }
 
 
 def discover_pending_external_books(rag, library_path: Path, adapter=None) -> List[Dict[str, Any]]:
@@ -1641,6 +1701,11 @@ Profiles:
                         help='Remove index entries for books deleted from Calibre. '
                              'Can be used standalone or combined with an indexing run. '
                              'Use --dry-run to preview orphans without deleting.')
+    parser.add_argument('--allow-large-orphan-cleanup', action='store_true',
+                        help='Authorise an orphan cleanup that exceeds the safety bound '
+                             f'(>{int(ORPHAN_SHARE_LIMIT * 100)}%% of the index AND '
+                             f'>{ORPHAN_COUNT_LIMIT} books). For deliberate bulk deletions; '
+                             'a scan that reported errors is still refused.')
     parser.add_argument('--prepare-pending-external', action='store_true',
                         help='Discover books indexed provisionally light (full-external '
                              'mode, marked pending_external) and re-prepare them '
@@ -2014,7 +2079,8 @@ def main():
 
     # Orphan cleanup (after indexing, or standalone)
     if args.cleanup_orphans:
-        cleanup_orphans(rag, library_path, dry_run=args.dry_run, adapter=adapter)
+        cleanup_orphans(rag, library_path, dry_run=args.dry_run, adapter=adapter,
+                        allow_large=args.allow_large_orphan_cleanup)
 
 
 if __name__ == '__main__':

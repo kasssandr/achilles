@@ -681,11 +681,14 @@ class TestZoteroOrphanCleanup:
             "GONE01": {"metadata_hash": "h", "annotation_hash": ""},
         }
         with patch.object(scanner, '_load_indexed_hashes', return_value=stored), \
-             patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls:
+             patch("src.storage.lancedb_store.LanceDBStore") as mock_store_cls, \
+             patch("src.archilles.watchdog.backup_orphan_chunks") as mock_backup:
             mock_store_cls.return_value.delete_by_book_id.return_value = 3
+            mock_backup.return_value = tmp_path / "backups" / "orphans.parquet"
             results = scanner.scan(dry_run=False, queue_new=False)
 
         mock_store_cls.return_value.delete_by_book_id.assert_called_once_with("GONE01")
+        mock_backup.assert_called_once()
         assert results['orphans_removed'] == 1
         assert not results['errors']
 

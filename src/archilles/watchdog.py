@@ -43,6 +43,10 @@ from src.archilles.constants import PREFERRED_FORMATS as _PREFERRED_FORMATS  # n
 # existing imports.
 from src.archilles.config import DEFAULT_EXCLUDED_TAGS  # noqa: E402, F401
 from src.archilles.indexer import IndexingCheckpoint  # noqa: E402
+from src.archilles.orphan_guard import (  # noqa: E402
+    backup_orphan_chunks,
+    check_orphan_bound,
+)
 from src.archilles.sqlite_ro import connect_readonly  # noqa: E402
 
 
@@ -330,6 +334,10 @@ def _cleanup_orphaned_books(
     orphan_book_ids: list[str],
     dry_run: bool,
     results: dict,
+    *,
+    indexed_count: int,
+    allow_large: bool = False,
+    scan_incomplete: bool = False,
 ) -> None:
     """Remove index entries for books that no longer exist in the source library.
 
@@ -339,6 +347,13 @@ def _cleanup_orphaned_books(
     successfully scanned, non-empty library snapshot — on an empty snapshot
     they skip the cleanup entirely so a read glitch can never wipe the index.
 
+    That empty-snapshot check catches only the total failure. ``check_orphan_bound``
+    (review 1.1) adds the range between it and a correct scan: a partial read
+    that still returns *some* books would otherwise delete everything it did
+    not see. Before deleting, the doomed rows go to Parquet — the rollback
+    cannot be LanceDB's two-day version window, because the weekly status mail
+    is what would make a wrong deletion visible.
+
     Deletion failures are recorded in ``results['errors']`` but do not abort
     the scan; the orphan is re-detected on the next run.
     """
@@ -346,6 +361,21 @@ def _cleanup_orphaned_books(
     results['orphans_removed'] = 0
     if not orphan_book_ids:
         return
+
+    bound = check_orphan_bound(
+        orphan_count=len(orphan_book_ids),
+        indexed_count=indexed_count,
+        allow_large=allow_large,
+        scan_incomplete=scan_incomplete,
+    )
+    results['orphan_bound'] = bound.as_dict()
+    if not bound.allowed:
+        results['orphan_cleanup_refused'] = True
+        logger.error("Orphan cleanup refused: %s", bound.reason)
+        print(f"\n⛔ {bound.reason}")
+        print(f"   {len(orphan_book_ids)} book(s) stay in the index.")
+        return
+
     suffix = " (dry-run: kept)" if dry_run else ""
     print(f"\n🗑️  {len(orphan_book_ids)} indexed book(s) no longer in the "
           f"library — removing from index{suffix}")
@@ -353,6 +383,19 @@ def _cleanup_orphaned_books(
         return
     from src.storage.lancedb_store import LanceDBStore
     store = LanceDBStore(db_path)
+
+    backup_path = backup_orphan_chunks(
+        store, results['orphans_found'], Path(db_path).parent / "backups"
+    )
+    if backup_path is None:
+        results['orphan_cleanup_refused'] = True
+        logger.error("Orphan backup failed — refusing to delete %d book(s)",
+                     len(orphan_book_ids))
+        print("\n⛔ Could not back up the orphaned chunks — nothing deleted.")
+        return
+    results['orphan_backup_path'] = str(backup_path)
+    print(f"   💾 Rollback written to {backup_path}")
+
     for book_id in results['orphans_found']:
         try:
             deleted = store.delete_by_book_id(book_id)
@@ -430,6 +473,7 @@ class WatchdogScanner:
         first_tags: list[str] | None = None,
         first_titles: list[str] | None = None,
         rating_filter: int | None = None,
+        allow_large_orphan_cleanup: bool = False,
     ) -> dict[str, Any]:
         """
         Run a full scan and return a results dict.
@@ -453,6 +497,9 @@ class WatchdogScanner:
         rating_filter          Restrict the fulltext-pending backlog (Phase 4) to books
                                with exactly this star rating. 0 = unrated, 1–5 = N stars.
                                None = no restriction. Has no effect on other phases.
+        allow_large_orphan_cleanup
+                               Authorise an orphan deletion above the safety bound
+                               (review 1.1). For deliberate bulk deletions only.
 
         Within each priority group, books are ordered by rating (5★, then 4★, then
         everything else) and then by recency (most recently added Calibre ID first).
@@ -570,14 +617,20 @@ class WatchdogScanner:
         # ── Orphan cleanup: indexed books deleted from Calibre ────────
         # Guard: an empty library snapshot would make every indexed book
         # look orphaned — treat that as a scan problem and skip (same
-        # caution as the hash-load guard above, 2.5).
+        # caution as the hash-load guard above, 2.5). The proportionality
+        # bound inside _cleanup_orphaned_books covers the partial snapshot
+        # this check cannot see (review 1.1).
         if calibre_books:
             orphan_ids = [
                 h.get('book_id') or str(cid)
                 for cid, h in indexed_hashes.items()
                 if cid not in calibre_books
             ]
-            _cleanup_orphaned_books(self.db_path, orphan_ids, dry_run, results)
+            _cleanup_orphaned_books(
+                self.db_path, orphan_ids, dry_run, results,
+                indexed_count=len(indexed_hashes),
+                allow_large=allow_large_orphan_cleanup,
+            )
 
         # ── Phase 2: apply delta updates ──────────────────────────────
         # When Phase 4 will drain the full backlog (index_fulltext_pending=True
@@ -1225,6 +1278,7 @@ class ZoteroWatchdogScanner:
         first_tags: list[str] | None = None,
         first_titles: list[str] | None = None,
         first_collections: list[str] | None = None,
+        allow_large_orphan_cleanup: bool = False,
     ) -> dict[str, Any]:
         """Run a full scan and return a results dict."""
         t0 = time.time()
@@ -1339,7 +1393,11 @@ class ZoteroWatchdogScanner:
         # against an empty snapshot as in the Calibre scanner.
         if zotero_items:
             orphan_ids = [k for k in indexed_hashes if k not in zotero_items]
-            _cleanup_orphaned_books(self.db_path, orphan_ids, dry_run, results)
+            _cleanup_orphaned_books(
+                self.db_path, orphan_ids, dry_run, results,
+                indexed_count=len(indexed_hashes),
+                allow_large=allow_large_orphan_cleanup,
+            )
 
         # ── Phase 2: apply delta updates ─────────────────────────
         books_to_update = set(results['metadata_changed']) | set(results['annotations_changed'])

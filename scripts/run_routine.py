@@ -266,6 +266,17 @@ def main() -> int:
         return 0
 
     if not runtime_lock.acquire(f"run_routine({args.source})", wait_s=args.wait_for_lock):
+        # Log it like the frequency SKIP above. This abort used to leave no
+        # trace at all: acquire() reports it on stderr, which lives only in
+        # the console window, so a routine that waited out its timeout looked
+        # exactly like one that never started. Observed 2026-09-04, when a
+        # reboot left a stale lock and two routines dropped their day
+        # silently.
+        msg = (f"[{datetime.now().astimezone().isoformat()}] {args.source}: SKIP "
+               f"(routine lock still held after {args.wait_for_lock}s wait)")
+        print(msg)
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(msg + "\n")
         return 1
     heartbeat_stop = threading.Event()
     runtime_lock.start_heartbeat(heartbeat_stop)

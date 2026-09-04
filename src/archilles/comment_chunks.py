@@ -15,9 +15,11 @@ The rule the review draws from it, worth stating where the code lives:
     a re-embed removes it.
 
 Merging the two copies surfaced a divergence nobody had noticed: the duplicate
-joined tags with ``" / "`` where the indexer used ``", "``. Measured in the
-live Calibre index at the time of the merge: 11 rows carried the slash form
-against 27 268 with the comma form, and ``tags`` is a filterable field.
+joined tags with ``" / "`` where the indexer used ``", "``. Note when reading a
+count of it: most ``" / "`` in the index belongs to a tag *name* (BISAC
+categories such as ``HISTORY / Military / Aviation``), where ``", "`` is
+already the separator. Exactly one book had actually used the slash as a
+separator, and it was repaired in place on 2026-09-04.
 
 Embedding is deliberately *not* here. This module composes text and metadata;
 the caller decides whether and how to encode, which is what let the two copies
@@ -45,7 +47,8 @@ def format_tags(tags: Any) -> str:
     """Tags as one string, comma-separated.
 
     ``", "`` is canonical — it is what the indexer has always written and what
-    27 268 of the 27 279 tagged comment rows in the live index carry.
+    the live index carries. Tag names may themselves contain ``" / "``, so this
+    separator is never safe to "repair" by string replacement.
     """
     if not tags:
         return ""

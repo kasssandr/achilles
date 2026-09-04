@@ -10,10 +10,15 @@ the corpus, and the rule the review draws from it is worth stating plainly:
 
 Comparing the two before merging them found a divergence the review does not
 mention: the duplicate joined tags with ``" / "`` while the indexer uses
-``", "``. Measured in the live Calibre index: 11 ``calibre_comment`` rows carry
-the slash form against 27 268 with the comma form. `tags` is a filterable
-field, so those 11 rows answer a tag filter differently from every other row of
-the same book.
+``", "``.
+
+Measuring it properly mattered more than finding it. A first count said "11
+rows carry the slash form" — but almost all of those are tag *names* that
+contain a slash (BISAC categories like ``HISTORY / Military / Aviation``),
+where ``", "`` is already the separator. Exactly **one book** used ``" / "`` as
+a separator: its two ``calibre_comment`` rows disagreed with the other rows of
+the same book and with Calibre. The mechanical replacement that the first count
+suggested would have shredded 305 correct rows.
 """
 
 import pytest
@@ -62,6 +67,11 @@ class TestTagsHaveOneFormat:
 
     def test_the_canonical_separator_is_the_comma(self):
         assert format_tags(["a", "b"]) == "a, b"
+
+    def test_a_tag_containing_a_slash_survives(self):
+        """BISAC categories are one tag, not three. The live index holds 305
+        such rows, and a naive ' / ' -> ', ' repair would have split them."""
+        assert format_tags(["HISTORY / Military / Aviation", "Aviation"]) ==             "HISTORY / Military / Aviation, Aviation"
 
     def test_a_string_passes_through(self):
         assert format_tags("already, formatted") == "already, formatted"

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from tqdm import tqdm
 
+from src.archilles.comment_chunks import build_comment_chunks
 from src.archilles.constants import ChunkType
 from src.archilles.indexer import IndexingCheckpoint
 from src.calibre_db import CalibreDB
@@ -1551,93 +1552,10 @@ class Indexer:
         Returns:
             (chunks, embeddings) — parallel lists ready for store.add_chunks()
         """
-        comments_html = book_metadata.get('comments_html', '')
-        if comments_html:
-            sections = CalibreDB.parse_html_comment(comments_html)
-        else:
-            plain = book_metadata.get('comments', '')
-            sections = [{'headline': None, 'headline_level': None,
-                         'text': plain, 'key_passages': []}] if plain else []
-
-        if not sections:
-            return [], []
-
-        # Split sections that are too long for a useful single embedding.
-        # BGE-M3 retrieval quality degrades significantly beyond ~500 words.
-        # Long headline-less sections (e.g. a 3500-word comment block) are
-        # split at word boundaries into sub-chunks of MAX_COMMENT_WORDS each.
-        MAX_COMMENT_WORDS = 400
-
-        def split_section(section: dict) -> list:
-            words = section['text'].split()
-            if len(words) <= MAX_COMMENT_WORDS:
-                return [section]
-            # Split at sentence boundaries (. ! ?) — never mid-sentence
-            sentences = re.split(r'(?<=[.!?])\s+', section['text'])
-            sub_sections = []
-            current_words = 0
-            current_sents: list[str] = []
-            first = True
-            for sent in sentences:
-                sent_words = len(sent.split())
-                if current_sents and current_words + sent_words > MAX_COMMENT_WORDS:
-                    sub_sections.append({
-                        'headline': section['headline'],
-                        'headline_level': section['headline_level'],
-                        'text': ' '.join(current_sents),
-                        'key_passages': section['key_passages'] if first else [],
-                    })
-                    first = False
-                    current_sents = [sent]
-                    current_words = sent_words
-                else:
-                    current_sents.append(sent)
-                    current_words += sent_words
-            if current_sents:
-                sub_sections.append({
-                    'headline': section['headline'],
-                    'headline_level': section['headline_level'],
-                    'text': ' '.join(current_sents),
-                    'key_passages': section['key_passages'] if first else [],
-                })
-            return sub_sections
-
-        flat_sections = []
-        for section in sections:
-            flat_sections.extend(split_section(section))
-
-        chunks, texts = [], []
-        title = book_metadata.get('title', book_id)
-
-        for i, section in enumerate(flat_sections):
-            parts = []
-            if section['headline']:
-                parts.append(f"## {section['headline']} ##")
-            if section['key_passages']:
-                kp = ' | '.join(section['key_passages'])
-                parts.append(f"Key points: {kp}")
-            if section['text']:
-                parts.append(section['text'])
-
-            chunk_text = f"[CALIBRE_COMMENT] {' '.join(parts)}"
-
-            chunk = {
-                'id': f"{book_id}_comment_{i}",
-                'text': chunk_text,
-                'book_id': book_id,
-                'book_title': title,
-                'chunk_index': -(i + 1),
-                'chunk_type': ChunkType.CALIBRE_COMMENT,
-                'format': book_format,
-                'indexed_at': datetime.now().isoformat(),
-                'metadata_hash': metadata_hash,
-            }
-            if section['headline']:
-                chunk['section_title'] = section['headline']
-            self._apply_book_metadata_to_chunk(chunk, book_metadata)
-
-            chunks.append(chunk)
-            texts.append(chunk_text)
+        chunks = build_comment_chunks(
+            book_metadata, book_id, book_format, metadata_hash,
+        )
+        texts = [c['text'] for c in chunks]
 
         # Batch-encode all comment texts at once
         if embed and texts:

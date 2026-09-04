@@ -22,6 +22,7 @@ from pathlib import Path
 
 # ── project imports ──────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.archilles.comment_chunks import build_comment_chunks
 from src.archilles.config import get_library_path
 from src.archilles.constants import ChunkType
 from src.archilles.sqlite_ro import connect_readonly
@@ -48,102 +49,18 @@ def _build_comment_chunks_standalone(
     book_format: str,
     metadata_hash: str,
 ) -> list:
-    """Build calibre_comment chunk dicts from Calibre comments (no embeddings)."""
-    MAX_COMMENT_WORDS = 400
+    """Build calibre_comment chunk dicts (no embeddings).
 
-    comments_html = book_metadata.get('comments_html', '')
-    if comments_html:
-        sections = CalibreDB.parse_html_comment(comments_html)
-    else:
-        plain = book_metadata.get('comments', '')
-        sections = [{'headline': None, 'headline_level': None,
-                     'text': plain, 'key_passages': []}] if plain else []
+    Thin wrapper over the one implementation in
+    ``src/archilles/comment_chunks`` (finding 1.8). This function used to be a
+    hand-copied duplicate of ``Indexer._build_comment_chunks`` — identical
+    wording, identical constants, no coupling — and it had already drifted:
+    it joined tags with " / " where the indexer used ", ", leaving 11 rows in
+    the live index that answer a tag filter differently from their neighbours.
 
-    if not sections:
-        return []
-
-    # Split long sections at sentence boundaries
-    def split_section(section: dict) -> list:
-        words = section['text'].split()
-        if len(words) <= MAX_COMMENT_WORDS:
-            return [section]
-        sentences = re.split(r'(?<=[.!?])\s+', section['text'])
-        sub_sections = []
-        current_words = 0
-        current_sents: list = []
-        first = True
-        for sent in sentences:
-            sent_words = len(sent.split())
-            if current_sents and current_words + sent_words > MAX_COMMENT_WORDS:
-                sub_sections.append({
-                    'headline': section['headline'],
-                    'headline_level': section['headline_level'],
-                    'text': ' '.join(current_sents),
-                    'key_passages': section['key_passages'] if first else [],
-                })
-                first = False
-                current_sents = [sent]
-                current_words = sent_words
-            else:
-                current_sents.append(sent)
-                current_words += sent_words
-        if current_sents:
-            sub_sections.append({
-                'headline': section['headline'],
-                'headline_level': section['headline_level'],
-                'text': ' '.join(current_sents),
-                'key_passages': section['key_passages'] if first else [],
-            })
-        return sub_sections
-
-    flat_sections = []
-    for section in sections:
-        flat_sections.extend(split_section(section))
-
-    chunks = []
-    title = book_metadata.get('title', book_id)
-
-    for i, section in enumerate(flat_sections):
-        parts = []
-        if section['headline']:
-            parts.append(f"## {section['headline']} ##")
-        if section['key_passages']:
-            kp = ' | '.join(section['key_passages'])
-            parts.append(f"Key points: {kp}")
-        if section['text']:
-            parts.append(section['text'])
-
-        chunk_text = f"[CALIBRE_COMMENT] {' '.join(parts)}"
-
-        chunk = {
-            'id': f"{book_id}_comment_{i}",
-            'text': chunk_text,
-            'book_id': book_id,
-            'book_title': title,
-            'chunk_index': -(i + 1),
-            'chunk_type': ChunkType.CALIBRE_COMMENT,
-            'format': book_format,
-            'indexed_at': datetime.now().isoformat(),
-            'metadata_hash': metadata_hash,
-        }
-        if section['headline']:
-            chunk['section_title'] = section['headline']
-
-        # Apply standard book metadata
-        if book_metadata.get('author'):
-            chunk['author'] = book_metadata['author']
-        if book_metadata.get('publisher'):
-            chunk['publisher'] = book_metadata['publisher']
-        if book_metadata.get('calibre_id'):
-            chunk['calibre_id'] = book_metadata['calibre_id']
-            chunk['source_id'] = str(book_metadata['calibre_id'])
-        if book_metadata.get('tags'):
-            chunk['tags'] = _format_tags(book_metadata['tags'])
-
-        chunks.append(chunk)
-
-    return chunks
-
+    Chunk text is frozen into vectors, so it gets exactly one implementation.
+    """
+    return build_comment_chunks(book_metadata, book_id, book_format, metadata_hash)
 
 def fetch_calibre_comments(calibre_db_path: Path, calibre_id: int) -> dict:
     """Fetch comments_html and comments_text for a book from Calibre."""

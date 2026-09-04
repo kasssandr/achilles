@@ -12,9 +12,11 @@ LanceDB, and routes tool calls:
 - aggregation tools (search, list-style) fan out across all sources in
   parallel and merge the results — search-tools merge by score, list-tools
   concatenate with source markers;
-- Calibre-only tools (``detect_duplicates``, ``watchdog_scan``) are gated
-  behind :pyattr:`UnifiedMCPServer.calibre_sources` and require an explicit
-  ``source``;
+- ``detect_duplicates`` is gated behind
+  :pyattr:`UnifiedMCPServer.calibre_sources` and requires an explicit
+  ``source``; ``watchdog_scan`` is gated behind
+  :pyattr:`UnifiedMCPServer.watchdog_sources` (Calibre *and* Zotero — both have
+  a hash-diff scanner);
 - ``set_research_interests`` reads/writes a master file when ``source`` is
   ``None``, or the source-local file when set, and the search-time boost
   layers them via ``load_effective_research_interests``.
@@ -98,7 +100,11 @@ def merge_source_results(per_source: list, top_k: int) -> list:
 # ── Tool classification (used by create_unified_tools) ────────────────────
 
 _REMOVED_TOOLS = {"get_doublette_tag_instruction"}
-_CALIBRE_ONLY_TOOLS = {"detect_duplicates", "watchdog_scan"}
+_CALIBRE_ONLY_TOOLS = {"detect_duplicates"}
+# Tools that need a hash-diff scanner: Calibre or Zotero, not path-keyed
+# sources. Kept apart from _CALIBRE_ONLY_TOOLS so the source enum each one
+# advertises matches what it can actually serve.
+_WATCHDOG_TOOLS = {"watchdog_scan"}
 _PATH_INFERRED_TOOLS = {"get_book_annotations", "compute_annotation_hash"}
 _AGGREGATION_TOOLS = {
     "search_books_with_citations",
@@ -251,6 +257,22 @@ class UnifiedMCPServer:
             name
             for name, srv in self.servers.items()
             if srv.adapter is not None and srv.adapter.adapter_type == "calibre"
+        ]
+
+    @property
+    def watchdog_sources(self) -> list[str]:
+        """Sources that have a hash-diff scanner: Calibre and Zotero.
+
+        Both scanners have existed for months and run daily through the
+        scheduled routines; only the MCP tool was Calibre-only, which left
+        Zotero unscannable from a client. Path-keyed sources (folder,
+        obsidian) have no hash-diff scanner yet and are not listed.
+        """
+        return [
+            name
+            for name, srv in self.servers.items()
+            if srv.adapter is not None
+            and srv.adapter.adapter_type in ("calibre", "zotero")
         ]
 
     @property
@@ -805,22 +827,24 @@ class UnifiedMCPServer:
         dry_run: bool = False,
         queue_new: bool = True,
         index_new: bool = False,
+        max_new: int | None = None,
     ) -> dict[str, Any]:
         try:
             srv = self.resolve_source(source)
         except KeyError as e:
             return {"error": str(e), "available_sources": self.source_names}
-        if source not in self.calibre_sources:
-            atype = srv.adapter.adapter_type if srv.adapter else "non-Calibre"
+        if source not in self.watchdog_sources:
+            atype = srv.adapter.adapter_type if srv.adapter else "unknown"
             return {
                 "error": (
-                    f"watchdog_scan is currently Calibre-only; {source!r} is a "
-                    f"{atype} source"
+                    f"watchdog_scan supports Calibre and Zotero sources; "
+                    f"{source!r} is a {atype} source"
                 ),
-                "calibre_sources": self.calibre_sources,
+                "watchdog_sources": self.watchdog_sources,
             }
         res = srv.watchdog_scan_tool(
             dry_run=dry_run, queue_new=queue_new, index_new=index_new,
+            max_new=max_new,
         )
         if isinstance(res, dict):
             res["source"] = source
@@ -848,6 +872,7 @@ def create_unified_tools(server: UnifiedMCPServer) -> list[dict]:
     base_tools = create_mcp_tools(seed)
     source_names = server.source_names
     have_calibre = bool(server.calibre_sources)
+    watchdog_sources = server.watchdog_sources
 
     out: list[dict] = []
     for tool in base_tools:
@@ -856,16 +881,26 @@ def create_unified_tools(server: UnifiedMCPServer) -> list[dict]:
             continue
         if name in _CALIBRE_ONLY_TOOLS and not have_calibre:
             continue
+        if name in _WATCHDOG_TOOLS and not watchdog_sources:
+            continue
 
-        if name in _CALIBRE_ONLY_TOOLS:
+        if name in _CALIBRE_ONLY_TOOLS or name in _WATCHDOG_TOOLS:
+            gated_sources = (
+                watchdog_sources if name in _WATCHDOG_TOOLS
+                else server.calibre_sources
+            )
+            what = (
+                "Calibre or Zotero source name (required — these are the "
+                "sources with a change scanner)."
+                if name in _WATCHDOG_TOOLS
+                else "Calibre source name (required — this tool is Calibre-specific)."
+            )
             schema = dict(tool["inputSchema"])
             props = dict(schema.get("properties") or {})
             props["source"] = {
                 "type": "string",
-                "enum": server.calibre_sources,
-                "description": (
-                    "Calibre source name (required — this tool is Calibre-specific)."
-                ),
+                "enum": gated_sources,
+                "description": what,
             }
             schema["properties"] = props
             req_list = list(schema.get("required") or [])

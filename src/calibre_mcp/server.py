@@ -802,9 +802,19 @@ class CalibreMCPServer:
         first_authors: list[str] | None = None,
         first_tags: list[str] | None = None,
         first_titles: list[str] | None = None,
+        max_new: int | None = None,
     ) -> dict[str, Any]:
         """
-        MCP Tool: Scan the Calibre library for changes and sync into LanceDB.
+        MCP Tool: Scan the library for changes and sync into LanceDB.
+
+        Serves **Calibre and Zotero** sources. Both scanners have existed for
+        months and both run daily through the scheduled routines; only this
+        tool was Calibre-only, so from a client Zotero could not be scanned at
+        all — capability present, access missing.
+
+        ``max_new`` caps how many new items a run indexes. It matters most for
+        Zotero, whose backlog is large enough that an uncapped run cannot
+        finish inside a client's request timeout.
 
         Detects three change types:
           new_books          — in Calibre but not yet indexed
@@ -834,6 +844,7 @@ class CalibreMCPServer:
             first_authors: Substring list — books by matching author are indexed first.
             first_tags:    Substring list — books carrying a matching tag are indexed first.
             first_titles:  Substring list — books with a matching title are indexed first.
+            max_new:       Cap on new items indexed in this run (None = no cap).
 
         Within each priority group, books are ordered 5★ → 4★ → 3★ → unrated → 2–1★.
 
@@ -848,10 +859,29 @@ class CalibreMCPServer:
         if not self._archilles_dir:
             return {'error': 'Archilles directory not resolved'}
 
+        adapter_type = getattr(self.adapter, "adapter_type", "calibre") if self.adapter else "calibre"
+        if adapter_type not in ("calibre", "zotero"):
+            return {
+                'error': (
+                    f"watchdog_scan supports Calibre and Zotero sources; this "
+                    f"one is {adapter_type!r}"
+                ),
+                'help': (
+                    "Path-keyed sources (folder, obsidian) sync via "
+                    "scripts/batch_index.py --all --skip-existing; they have no "
+                    "hash-diff scanner yet."
+                ),
+            }
+
         try:
             from src.archilles.config import get_excluded_tags
-            from src.archilles.watchdog import WatchdogScanner
-            scanner = WatchdogScanner(
+            from src.archilles import watchdog as _watchdog
+
+            scanner_cls = (
+                _watchdog.ZoteroWatchdogScanner if adapter_type == "zotero"
+                else _watchdog.WatchdogScanner
+            )
+            scanner = scanner_cls(
                 library_path=self.library_path,
                 db_path=self.rag_db_path,
                 archilles_dir=self._archilles_dir,
@@ -864,6 +894,7 @@ class CalibreMCPServer:
                 first_authors=first_authors,
                 first_tags=first_tags,
                 first_titles=first_titles,
+                max_new=max_new,
             )
             # Add human-readable summary for the Routine output
             summary = (

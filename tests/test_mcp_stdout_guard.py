@@ -11,7 +11,9 @@ the guard sits at the single dispatch point every tool passes through.
 """
 
 import io
+import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -143,3 +145,89 @@ class TestLibraryLayerDoesNotPrint:
 
         assert warn_if_light_plan_hides_hierarchy(_Full(), self._Store()) is False
         assert capsys.readouterr().out == ""
+
+
+# ── the protocol channel must not be a global ────────────────────────
+
+class TestResponsesAlwaysReachTheRealStdout:
+    """Found by driving the real server: the response to a tools/call arrived
+    on **stderr** and the client saw nothing.
+
+    ``stdio_server`` resolved ``sys.stdout`` at write time, while the
+    background model-preload thread was inside the redirect — so for the
+    duration of a preload, every response went to stderr. The race predates the
+    dispatch guard (the service layer already redirected from that thread), but
+    guarding every dispatch widened it. The protocol channel is captured once
+    at startup instead.
+    """
+
+    def _drive(self, monkeypatch, requests, tool_impl):
+        import asyncio
+        import json
+
+        real_out = io.StringIO()
+        real_err = io.StringIO()
+        stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+
+        monkeypatch.setattr(sys, "stdin", stdin)
+        monkeypatch.setattr(sys, "stdout", real_out)
+        monkeypatch.setattr(sys, "stderr", real_err)
+        monkeypatch.setattr(mcp_server, "_reconfigure_stdio_utf8",
+                            lambda *a, **k: None)
+        monkeypatch.setitem(mcp_server.TOOL_MAP, "probe_tool", "probe_tool")
+
+        server = SimpleNamespace(probe_tool=tool_impl)
+        tools = [{"name": "probe_tool", "description": "d", "inputSchema": {}}]
+        asyncio.run(mcp_server.stdio_server(server, tools))
+        return real_out.getvalue(), real_err.getvalue()
+
+    def test_response_lands_on_stdout_while_a_thread_holds_the_redirect(
+        self, monkeypatch
+    ):
+        """A background thread inside the redirect must not divert responses."""
+        holder = redirect_stdout_to_stderr()
+
+        def tool(**kwargs):
+            holder.__enter__()  # enter and do NOT exit — as a preload would
+            return {"ok": True}
+
+        try:
+            out, _err = self._drive(
+                monkeypatch,
+                [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "probe_tool", "arguments": {}}}],
+                tool,
+            )
+        finally:
+            holder.__exit__(None, None, None)
+
+        assert out.strip(), "the response must reach the protocol channel"
+        payload = json.loads(out.strip().splitlines()[0])
+        assert payload["id"] == 1
+        assert "result" in payload
+
+    def test_ordinary_responses_still_reach_stdout(self, monkeypatch):
+        out, _err = self._drive(
+            monkeypatch,
+            [{"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}}],
+            lambda **kw: {"ok": True},
+        )
+
+        payload = json.loads(out.strip().splitlines()[0])
+        assert payload["id"] == 7
+        assert payload["result"]["tools"][0]["name"] == "probe_tool"
+
+    def test_every_line_written_is_valid_json(self, monkeypatch):
+        out, _err = self._drive(
+            monkeypatch,
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "probe_tool", "arguments": {}}},
+            ],
+            lambda **kw: {"ok": True},
+        )
+
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        assert [json.loads(ln)["id"] for ln in lines] == [1, 2]

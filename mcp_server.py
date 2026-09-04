@@ -325,9 +325,19 @@ async def stdio_server(server, tools: list[dict]):
     """
     logger.info("Starting ARCHILLES MCP Server (stdio mode)")
 
+    # Capture the protocol channel ONCE, and write every response to this
+    # object rather than resolving sys.stdout at write time. Several code
+    # paths temporarily point sys.stdout at stderr to keep stray prints out of
+    # the JSON-RPC stream (src/archilles/stdout_guard.py) — including the
+    # background model-preload thread, which holds the redirect for as long as
+    # a model takes to load. Resolving sys.stdout per write meant that during a
+    # preload every response was written to stderr and the client saw nothing.
+    # Observed live on a watchdog_scan call, 2026-09-04.
+    out = sys.stdout
+
     # UTF-8 + line buffering (important on Windows: default stdin decoding
     # is the locale code page, which mangles non-ASCII queries)
-    _reconfigure_stdio_utf8(sys.stdin, sys.stdout)
+    _reconfigure_stdio_utf8(sys.stdin, out)
 
     logger.info(f"Registered {len(tools)} tools")
     for tool in tools:
@@ -361,8 +371,8 @@ async def stdio_server(server, tools: list[dict]):
         if response is None:
             continue
 
-        sys.stdout.write(json.dumps(response) + '\n')
-        sys.stdout.flush()
+        out.write(json.dumps(response) + '\n')
+        out.flush()
         logger.info(f"Sent response for request {request_id}")
 
 

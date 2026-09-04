@@ -906,6 +906,48 @@ class Indexer:
             'phase': 'phase1'
         }
 
+    def _replace_existing_chunks(
+        self,
+        book_id: str,
+        state: Dict[str, Any],
+        *,
+        drop_annotations: bool = False,
+    ) -> int:
+        """Remove what a full re-index replaces — never earlier than the write.
+
+        Two things this fixes, both from the same region (findings 1.5, 1.6):
+
+        **It runs unconditionally**, not only when the previous branch happened
+        to match. The old code deleted under ``has_content and force`` or under
+        ``total and not force``, so a stub-only book re-indexed *with* ``force``
+        matched neither: the stub survived beneath the new content. With 4 680
+        stubs in the backlog, most ``--force`` selections contained such books.
+
+        **It deletes rather than trusting the upsert.** ``add_chunks`` merges on
+        ``id``, which guarantees "no duplicate id" and nothing more: every row
+        whose id is not regenerated survives with its old text *and its old
+        vector* — the ``_metadata`` stub, ``_comment_3..7`` when the comment now
+        yields three sections, ``_annot_12..40`` when highlights were removed.
+        Nothing references them and search returns them. That is the mechanism
+        behind the leftovers `cec290c` had to clean by hand.
+
+        Annotation chunks are spared unless ``drop_annotations`` says this run
+        actually produced new ones (July's finding 2.2): highlights are imported
+        separately and can be weeks newer than the text, so a run that found
+        none must not take the existing ones with it.
+        """
+        if not state.get('total'):
+            return 0
+
+        deleted = self._rag.store.delete_by_book_id_except_annotations(book_id)
+        if drop_annotations:
+            deleted += self._rag.store.delete_by_book_id_and_type(
+                book_id, ChunkType.ANNOTATION,
+            )
+        if deleted:
+            print(f"    Replaced {deleted} existing chunk(s)")
+        return deleted
+
     def index_book(self, book_path: str, book_id: str = None, force: bool = False, phase: str = 'phase2') -> Dict[str, Any]:
         """
         Extract and index a book.
@@ -934,46 +976,42 @@ class Indexer:
         # get_by_book_id(limit=100) window missed the annotation/metadata
         # hashes for books with many chunks and re-embedded them every scan.
         state = self._rag.store.get_book_state(book_id)
-        if state['has_content']:
-            if force:
-                print(f"  Deleting existing chunks for {book_id}...", flush=True)
-                deleted = self._rag.store.delete_by_book_id(book_id)
-                print(f"    Deleted {deleted} chunks")
-            else:
-                # Check if metadata or annotations have changed (smart update without full re-index)
-                book_metadata = self._extract_metadata(book_path)
-                current_meta_hash = self._resolve_metadata_hash(book_id, book_metadata)
+        if state['has_content'] and not force:
+            # Check if metadata or annotations have changed (smart update without full re-index)
+            book_metadata = self._extract_metadata(book_path)
+            current_meta_hash = self._resolve_metadata_hash(book_id, book_metadata)
 
-                # Check annotation changes (adapter-aware, finding 1.4)
-                try:
-                    current_annotations = self._resolve_annotations(book_id, book_path)
-                    current_annot_hash = self._compute_annotation_hash(current_annotations)
-                except Exception:
-                    current_annotations = []
-                    current_annot_hash = ''
+            # Check annotation changes (adapter-aware, finding 1.4)
+            try:
+                current_annotations = self._resolve_annotations(book_id, book_path)
+                current_annot_hash = self._compute_annotation_hash(current_annotations)
+            except Exception:
+                current_annotations = []
+                current_annot_hash = ''
 
-                meta_changed = current_meta_hash != state['metadata_hash']
-                annot_changed = current_annot_hash != state['annotation_hash']
+            meta_changed = current_meta_hash != state['metadata_hash']
+            annot_changed = current_annot_hash != state['annotation_hash']
 
-                if meta_changed or annot_changed:
-                    return self._update_metadata_only(
-                        book_id, book_metadata, current_meta_hash, state,
-                        annotations=current_annotations if annot_changed else None,
-                        annotation_hash=current_annot_hash if annot_changed else None,
-                        book_path=book_path,
-                    )
+            if meta_changed or annot_changed:
+                return self._update_metadata_only(
+                    book_id, book_metadata, current_meta_hash, state,
+                    annotations=current_annotations if annot_changed else None,
+                    annotation_hash=current_annot_hash if annot_changed else None,
+                    book_path=book_path,
+                )
 
-                print(f"  Book already indexed ({state['content_count']} content chunks). Use --force to reindex.")
-                return {
-                    'book_id': book_id,
-                    'status': 'already_indexed',
-                    'chunks_indexed': state['content_count'],
-                    'existing_chunks': state['total']
-                }
-        elif state['total'] and not force:
-            # Has metadata-only chunks — delete them before full indexing
-            print(f"  Replacing {state['total']} metadata-only chunks with full content...")
-            self._rag.store.delete_by_book_id(book_id)
+            print(f"  Book already indexed ({state['content_count']} content chunks). Use --force to reindex.")
+            return {
+                'book_id': book_id,
+                'status': 'already_indexed',
+                'chunks_indexed': state['content_count'],
+                'existing_chunks': state['total']
+            }
+
+        # Nothing has been deleted yet, and nothing may be: both extraction
+        # steps below can raise, the watchdog's Phase 4 loop catches that and
+        # continues, and the book would be left with zero chunks (finding 1.5).
+        # The replacement is issued right before each write path instead.
 
         # Extract metadata (author, title, year, ISBN, publisher, etc.)
         # Works for PDF, EPUB, and other formats
@@ -981,10 +1019,14 @@ class Indexer:
 
         # MODULAR PIPELINE PATH: Use new architecture if flag is set
         if self._rag.use_modular_pipeline:
+            self._replace_existing_chunks(book_id, state)
             return self._index_book_modular_pipeline(book_path, book_id, book_metadata)
 
         # PHASE 1: Metadata + Comments only (fast indexing)
+        # The stub rebuild has no extraction step worth failing, so replacing
+        # here rather than after is safe.
         if phase == 'phase1':
+            self._replace_existing_chunks(book_id, state)
             return self._index_book_phase1(book_path, book_id, book_metadata)
 
         # PHASE 2: Full content indexing (default)
@@ -1086,6 +1128,12 @@ class Indexer:
         # Concatenate all embedding arrays (content + comments + annotations)
         all_arrays = [embeddings_array] + extra_embedding_arrays if len(embeddings_array) else extra_embedding_arrays
         embeddings_array = np.concatenate(all_arrays) if all_arrays else np.array([])
+
+        # Everything is extracted and embedded — only now is it safe to remove
+        # what this replaces (findings 1.5 and 1.6).
+        self._replace_existing_chunks(
+            book_id, state, drop_annotations=annot_count > 0,
+        )
 
         # Add to LanceDB
         num_indexed = self._rag.store.add_chunks(chunks, embeddings_array)

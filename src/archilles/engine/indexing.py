@@ -259,6 +259,63 @@ class Indexer:
             texts.append(annot_text)
         return chunks, texts
 
+    def _resolve_annotations(self, book_id: Optional[str],
+                             book_path: Any) -> List[Dict[str, Any]]:
+        """Canonical annotation source for a book (finding 1.4).
+
+        ``get_combined_annotations`` reads Calibre-viewer sidecars and
+        PDF-embedded annotations — nothing else. Zotero's own reader stores
+        highlights in ``zotero.sqlite``, so for a Zotero item that reader finds
+        nothing, while the scanner's change proxy (``attachment_modified_at``)
+        still fires, triggers a re-index, counts a delta update and exits 0.
+        The highlights the project's USP rests on were never indexed.
+
+        Non-Calibre sources therefore go through ``adapter.get_annotations``,
+        mapped onto the legacy dict shape ``_build_annotation_chunks`` expects.
+
+        **Calibre keeps the legacy reader**, and that is not an oversight:
+        ``CalibreAdapter.get_annotations`` calls the same function with
+        *different* arguments (no ``include_pdf``/``exclude_toc_markers``/
+        ``min_length``) and drops ``source`` when it maps into
+        ``DocumentAnnotation``. Routing Calibre through the adapter would
+        change which annotations exist and therefore every annotation hash —
+        a re-index of the whole library. This is the reindex-storm gate.
+
+        A failing adapter yields no annotations rather than falling back to the
+        Calibre reader: for a Zotero item that reader would return an empty
+        list anyway, and a silent fallback would hide the failure.
+        """
+        adapter = getattr(self._rag, "_adapter", None)
+        adapter_type = getattr(adapter, "adapter_type", "calibre")
+        if adapter is not None and adapter_type != "calibre" and book_id:
+            try:
+                doc_annotations = adapter.get_annotations(str(book_id))
+            except Exception as exc:
+                print(f"  ⚠️  adapter annotations failed for {book_id}: {exc}")
+                return []
+            return [
+                {
+                    'highlighted_text': a.text or '',
+                    'notes': a.note or '',
+                    'type': a.annotation_type or 'highlight',
+                    'page': a.page,
+                    'source': adapter_type,
+                    'timestamp': a.created or '',
+                }
+                for a in doc_annotations
+            ]
+
+        try:
+            result = get_combined_annotations(
+                book_path=str(book_path),
+                include_pdf=True,
+                exclude_toc_markers=True,
+                min_length=20,
+            )
+            return result.get('annotations', [])
+        except Exception:
+            return []
+
     @staticmethod
     def _build_annotation_text(annot: Dict[str, Any]) -> str:
         """
@@ -871,13 +928,9 @@ class Indexer:
                 book_metadata = self._extract_metadata(book_path)
                 current_meta_hash = self._resolve_metadata_hash(book_id, book_metadata)
 
-                # Check annotation changes
+                # Check annotation changes (adapter-aware, finding 1.4)
                 try:
-                    annot_result = get_combined_annotations(
-                        book_path=str(book_path), include_pdf=True,
-                        exclude_toc_markers=True, min_length=20
-                    )
-                    current_annotations = annot_result.get('annotations', [])
+                    current_annotations = self._resolve_annotations(book_id, book_path)
                     current_annot_hash = self._compute_annotation_hash(current_annotations)
                 except Exception:
                     current_annotations = []
@@ -980,16 +1033,12 @@ class Indexer:
             if comment_embeddings:
                 extra_embedding_arrays.append(np.array(comment_embeddings))
 
-        # Add user annotations (highlights, notes from Calibre Viewer + PDF)
+        # Add user annotations. Calibre: viewer sidecars + PDF-embedded.
+        # Other sources: through the adapter, which is where their reader keeps
+        # them — Zotero's highlights live in zotero.sqlite (finding 1.4).
         annot_count = 0
         try:
-            annot_result = get_combined_annotations(
-                book_path=str(book_path),
-                include_pdf=True,
-                exclude_toc_markers=True,
-                min_length=20
-            )
-            annotations = annot_result.get('annotations', [])
+            annotations = self._resolve_annotations(book_id, book_path)
             if annotations:
                 annot_hash = self._compute_annotation_hash(annotations)
 

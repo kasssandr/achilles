@@ -18,6 +18,10 @@ from src.adapters.base import (
     SourceAdapter,
 )
 from src.archilles.html_text import strip_html as _strip_html
+from src.archilles.annotation_providers.zotero_provider import (
+    zotero_annotation_type,
+    zotero_page_number,
+)
 from src.archilles.sqlite_ro import connect_readonly
 
 logger = logging.getLogger(__name__)
@@ -436,6 +440,16 @@ class ZoteroAdapter(SourceAdapter):
             conn.close()
 
     def get_annotations(self, doc_id: str) -> list[DocumentAnnotation]:
+        """Highlights and notes for one item, as the indexer consumes them.
+
+        This is the *only* route by which Zotero highlights reach the index
+        (finding 1.4) — the Calibre-viewer reader the indexer used before knows
+        nothing about ``zotero.sqlite``. Type and page therefore have to be
+        usable here, not merely present: they become ``annotation_type`` and
+        ``page_number`` on the chunk, and the page is what a citation names.
+        The mapping lives in ``annotation_providers.zotero_provider`` so this
+        adapter and the import path cannot drift apart.
+        """
         conn = self._connect()
         try:
             item_row = conn.execute("SELECT itemID FROM items WHERE key = ?", (doc_id,)).fetchone()
@@ -445,6 +459,15 @@ class ZoteroAdapter(SourceAdapter):
 
             annotations = []
 
+            # Older Zotero schemas — and the minimal fixtures built against
+            # them — have no sortIndex/pageLabel. Select what exists rather
+            # than raising "no such column" on the whole item.
+            available = {
+                r["name"] for r in conn.execute("PRAGMA table_info(itemAnnotations)")
+            }
+            page_columns = [c for c in ("sortIndex", "pageLabel") if c in available]
+            columns = ", ".join(["type", "text", "comment", *page_columns])
+
             # 1. PDF annotations (itemAnnotations via attachment)
             att_rows = conn.execute(
                 "SELECT itemID FROM itemAttachments WHERE parentItemID = ?",
@@ -452,23 +475,24 @@ class ZoteroAdapter(SourceAdapter):
             ).fetchall()
             for att in att_rows:
                 ann_rows = conn.execute(
-                    """
-                    SELECT type, text, comment, sortIndex
-                    FROM itemAnnotations
-                    WHERE parentItemID = ?
-                    """,
+                    f"SELECT {columns} FROM itemAnnotations WHERE parentItemID = ?",
                     (att["itemID"],),
                 ).fetchall()
                 for ar in ann_rows:
-                    ann_type = ar["type"] or "highlight"
                     text = ar["text"] or ""
                     comment = ar["comment"] or ""
-                    if text or comment:
-                        annotations.append(DocumentAnnotation(
-                            text=text,
-                            note=comment,
-                            annotation_type=ann_type,
-                        ))
+                    if not text and not comment:
+                        continue
+                    keys = ar.keys()
+                    annotations.append(DocumentAnnotation(
+                        text=text,
+                        note=comment,
+                        annotation_type=zotero_annotation_type(ar["type"]),
+                        page=zotero_page_number(
+                            ar["sortIndex"] if "sortIndex" in keys else "",
+                            ar["pageLabel"] if "pageLabel" in keys else "",
+                        ),
+                    ))
 
             # 2. Standalone notes (itemNotes)
             note_rows = conn.execute(

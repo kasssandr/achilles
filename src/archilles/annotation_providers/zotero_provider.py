@@ -23,17 +23,55 @@ from .base import Annotation, AnnotationProvider
 
 logger = logging.getLogger(__name__)
 
-# Zotero annotation type → unified type
+# Zotero annotation type → unified type.
+#
+# Zotero stores this column as an INTEGER (measured: every row in the live
+# library carries `type=1`), while some versions and exports use the name. The
+# map holds both, because a string-only lookup silently degrades every
+# annotation to "highlight" — which is what happened here until the adapter
+# path went live and made the raw `1` visible in the chunks.
 _ANNOT_TYPE_MAP = {
     "highlight": "highlight",
     "underline": "highlight",
     "note": "note",
     "image": "bookmark",
     "ink": "bookmark",
+    1: "highlight",
+    2: "note",
+    3: "bookmark",   # image
+    4: "bookmark",   # ink
+    5: "highlight",  # underline
 }
 
 # sortIndex format: "PPPPP|CCCCC|LLLLL"
 _SORT_INDEX_RE = re.compile(r"^(\d+)\|")
+
+
+def zotero_annotation_type(raw) -> str:
+    """Map Zotero's annotation type — integer or name — onto a unified name.
+
+    Unknown values fall back to ``"highlight"``, the overwhelmingly common
+    case and the behaviour every caller had before.
+    """
+    if isinstance(raw, str):
+        raw = raw.strip().lower()
+    return _ANNOT_TYPE_MAP.get(raw, "highlight")
+
+
+def zotero_page_number(sort_index: str, page_label: str = "") -> Optional[int]:
+    """The page a reader would cite, or ``None`` when Zotero knows neither.
+
+    ``pageLabel`` is the *printed* page number and wins: on real data the two
+    diverge (label ``159`` at sortIndex ``00000``), and a citation that names
+    the physical page of a PDF is wrong for anything with front matter. A
+    non-numeric label (roman numerals, "Cover") is not a number we can use, so
+    the physical page stands in.
+    """
+    label = (page_label or "").strip()
+    if label.isdigit():
+        return int(label)
+    physical = _parse_sort_index_page(sort_index)
+    return physical + 1 if physical is not None else None
 
 
 def _parse_sort_index_page(sort_index: str) -> Optional[int]:
@@ -180,15 +218,14 @@ class ZoteroAnnotationProvider(AnnotationProvider):
 
         annotations = []
         for row in rows:
-            unified_type = _ANNOT_TYPE_MAP.get(row["type"] or "", "highlight")
+            unified_type = zotero_annotation_type(row["type"])
             text = row["text"] or ""
             comment = row["comment"] or ""
             if not text and not comment:
                 continue
 
-            page_from_index = _parse_sort_index_page(row["sortIndex"] or "")
             page_label = row["pageLabel"] or ""
-            page_number = page_from_index + 1 if page_from_index is not None else None
+            page_number = zotero_page_number(row["sortIndex"] or "", page_label)
 
             parent_item_id = row["parent_item_id"]
             if parent_item_id:

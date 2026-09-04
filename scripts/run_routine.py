@@ -160,6 +160,7 @@ def _parse_stats(stdout: str, adapter: str) -> dict:
                 "new_indexed": data.get("new_indexed", 0),
                 "fulltext_indexed": data.get("fulltext_indexed", 0),
                 "orphans_removed": data.get("orphans_removed", 0),
+                "skipped_no_file": len(data.get("skipped_no_file", [])),
                 "errors": len(data.get("errors", [])),
             }
         except Exception:
@@ -405,6 +406,8 @@ def main() -> int:
                 parts.append(f"Fulltext indexed: {stats['fulltext_indexed']}")
             if stats.get('orphans_removed'):
                 parts.append(f"Orphans removed: {stats['orphans_removed']}")
+            if stats.get('skipped_no_file'):
+                parts.append(f"Not indexable: {stats['skipped_no_file']}")
             parts.append(f"Errors: {stats.get('errors', 0)}")
             print(f"\n  Watchdog finished in {duration:.0f}s — " + " | ".join(parts))
 

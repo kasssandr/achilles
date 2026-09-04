@@ -268,6 +268,73 @@ class ZoteroAdapter(SourceAdapter):
         # linkMode 3 = linked URL, linkMode 4 = embedded image — no local file
         return None
 
+    def describe_unresolved(self, doc_id: str) -> tuple[str, str]:
+        """Why this item has no indexable file: ``(category, detail)``.
+
+        ``_resolve_attachment_path`` has seven silent ``return None`` paths, and
+        Phase 3 turned every one of them into a bare ``continue`` (finding
+        1.15). The reasons differ completely in what they ask of the user — an
+        unset config key, a moved file, a web link with no local copy — so a
+        count alone is not actionable.
+
+        The category carries no path, so many items collapse into one line in a
+        summary; the detail carries the path, for the per-item log entry.
+        """
+        conn = self._connect()
+        try:
+            item_row = conn.execute(
+                "SELECT itemID FROM items WHERE key = ?", (doc_id,)
+            ).fetchone()
+            if not item_row:
+                return "item not found in zotero.sqlite", doc_id
+
+            rows = conn.execute(
+                "SELECT itemID, linkMode, path, contentType FROM itemAttachments "
+                "WHERE parentItemID = ?",
+                (item_row["itemID"],),
+            ).fetchall()
+            if not rows:
+                return "item has no attachment at all", ""
+
+            categories: list[str] = []
+            details: list[str] = []
+            for row in rows:
+                link_mode = row["linkMode"]
+                raw_path = row["path"] or ""
+
+                if link_mode == 3:
+                    categories.append("attachment is a linked URL, no local file")
+                elif link_mode == 4:
+                    categories.append("attachment is an embedded image, no local file")
+                elif link_mode == 2 and raw_path.startswith("attachments:"):
+                    rel = raw_path[len("attachments:"):]
+                    if self._linked_base is None:
+                        categories.append(
+                            "linked attachment is relative, but "
+                            "linked_attachment_base is not set for this source "
+                            "— set it in the source config"
+                        )
+                    else:
+                        categories.append("linked file does not exist")
+                    details.append(rel)
+                elif link_mode == 2:
+                    categories.append("linked file does not exist")
+                    details.append(raw_path)
+                elif raw_path.startswith("storage:"):
+                    categories.append("stored file missing from storage/")
+                    details.append(raw_path)
+                else:
+                    categories.append(f"unresolvable attachment (linkMode={link_mode})")
+                    details.append(raw_path)
+
+            # De-duplicate, order preserved: several attachments of one item
+            # usually fail for the same reason.
+            seen: set[str] = set()
+            unique = [c for c in categories if not (c in seen or seen.add(c))]
+            return "; ".join(unique), "; ".join(details)
+        finally:
+            conn.close()
+
     def _get_primary_attachment(self, conn: sqlite3.Connection, item_id: int) -> tuple[Path | None, str]:
         """Find the best attachment for an item. Returns (path, format)."""
         rows = conn.execute(

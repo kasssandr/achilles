@@ -150,6 +150,26 @@ class SourceAdapter(ABC):
                 return doc
         return None
 
+    def describe_unresolved(self, doc_id: str) -> tuple[str, str]:
+        """Why ``get_file_path`` returned ``None``: ``(category, detail)``.
+
+        ``None`` is a fact; the reason is what someone can act on. The live case
+        this exists for: 199 Zotero review items were queued, reached, and
+        silently skipped for two months because one config key
+        (``linked_attachment_base``) was unset — a counter alone would have said
+        "199 skipped" without ever naming it (finding 1.15).
+
+        Split in two on purpose. ``detail`` names *this* document (the path that
+        did not resolve) and belongs in the log line; ``category`` is what many
+        documents share and is what a summary groups by. Putting the path in the
+        category makes every entry unique and the summary useless — measured:
+        199 items produced 199 groups of one.
+
+        Returns ``("", "")`` when the adapter cannot explain; callers must treat
+        that as "no explanation available", not as "nothing wrong".
+        """
+        return "", ""
+
     def compute_metadata_hash(self, doc_id: str) -> str:
         """Stable hash over a document's key metadata fields.
 

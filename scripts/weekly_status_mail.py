@@ -153,6 +153,17 @@ def _format_source_block(name: str, adapter: str, library: Path, rows: list[dict
     # Deletions, always — at any count, including zero (review 1.10c). This is
     # the only report in which a wrong orphan cleanup would surface, and it
     # runs weekly; a deletion nobody mentions is a deletion nobody notices.
+    # Queued but not indexable (review 1.15). Shown only when non-zero: unlike a
+    # deletion, "nothing was skipped" is the normal case and needs no line.
+    skipped = sum((r.get("stats", {}) or {}).get("skipped_no_file", 0) or 0 for r in rows)
+    if skipped:
+        lines.append(
+            f"    Unindexierbar (in der Warteschlange, ohne Datei): {skipped}"
+        )
+        lines.append(
+            "      Grund steht im watchdog.log der Quelle (skipped_no_file)"
+        )
+
     orphans = sum((r.get("stats", {}) or {}).get("orphans_removed", 0) or 0 for r in rows)
     mark = "  ⚠️  ungewöhnlich viele — bitte prüfen" if orphans > ORPHAN_COUNT_LIMIT else ""
     lines.append(f"    Aus dem Index entfernt (Waisen): {orphans}{mark}")

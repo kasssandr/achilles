@@ -329,6 +329,76 @@ def _refresh_search_indexes(rag, results: dict, dry_run: bool) -> None:
         logger.warning("Index refresh after watchdog run failed: %s", exc)
 
 
+def _record_unindexable(
+    results: dict,
+    adapter,
+    doc_id: str,
+    title: str,
+    where: str,
+) -> None:
+    """Record an item that was queued, reached, and could not be indexed.
+
+    Finding 1.15: Phase 3 did ``if not file_path: continue`` — no log line, no
+    error entry, no counter. The item stayed in ``new_books``, stayed in the
+    queue, and the run exited 0. That is how ``Rezensionen`` came to be indexed
+    4 of 201 for two months without a single trace in ``watchdog.log``.
+
+    Deliberately **not** an entry in ``results['errors']``: nothing failed, and
+    an exit code driven by these would mark every routine run as broken until
+    the config is fixed. It is a counted, explained skip instead — visible in
+    the run's JSON, in ``routine_history.jsonl`` and in the weekly mail.
+    """
+    reason, detail = "", ""
+    try:
+        describe = getattr(adapter, "describe_unresolved", None)
+        if describe is not None:
+            reason, detail = describe(doc_id)
+    except Exception as exc:  # explaining must never break a scan
+        reason = f"(could not determine reason: {exc})"
+
+    results.setdefault('skipped_no_file', []).append({
+        'doc_id': doc_id,
+        'title': title,
+        'reason': reason,
+        'detail': detail,
+    })
+    logger.warning(
+        "No indexable file for %s (%s) in %s — %s%s",
+        doc_id, title or "?", where, reason or "reason unknown",
+        f" [{detail}]" if detail else "",
+    )
+
+
+def summarise_unindexable(entries: list[dict]) -> str:
+    """One line per *reason*, not per item.
+
+    199 identical warnings are noise; "199 items, all of them one unset config
+    key" is the finding. Empty input yields an empty string so callers can
+    print it unconditionally.
+    """
+    if not entries:
+        return ""
+
+    from collections import Counter
+
+    by_reason = Counter(e.get('reason') or "reason unknown" for e in entries)
+    lines = [
+        f"⚠️  {len(entries)} item(s) queued but not indexable:",
+    ]
+    for reason, count in by_reason.most_common():
+        lines.append(f"     {count:>5}×  {reason}")
+        # One example per group, so the line is actionable without being a list
+        # of 199 paths — the per-item detail is in the log.
+        example = next(
+            (e for e in entries
+             if (e.get('reason') or "reason unknown") == reason and e.get('detail')),
+            None,
+        )
+        if example:
+            lines.append(f"            e.g. {example['detail'][:100]}")
+    return "\n".join(lines)
+
+
 def _cleanup_orphaned_books(
     db_path: str,
     orphan_book_ids: list[str],
@@ -520,6 +590,7 @@ class WatchdogScanner:
             'fulltext_indexed_time': 0.0,
             'orphans_found':       [],   # book_ids indexed but gone from the library
             'orphans_removed':     0,
+            'skipped_no_file':     [],   # queued, reached, not indexable (1.15)
             'scanned':             0,
             'interrupted':         False,
         }
@@ -842,6 +913,12 @@ class WatchdogScanner:
         results['total_time'] = round(time.time() - t0, 1)
         results['interrupted'] = self._shutdown_requested
 
+        # Grouped by reason, not one line per item (1.15) — the point is which
+        # single cause accounts for how many, not that many were skipped.
+        unindexable = summarise_unindexable(results.get('skipped_no_file', []))
+        if unindexable:
+            print("\n" + unindexable)
+
         if not dry_run:
             # Persist the annotation cache and write the log even on graceful
             # shutdown so the partial run is recorded and the next scan benefits
@@ -1049,6 +1126,7 @@ class WatchdogScanner:
             f"  orphans_removed: {results.get('orphans_removed', 0)}"
             + (f" of {len(results.get('orphans_found', []))} {results.get('orphans_found', [])}"
                if results.get('orphans_found') else ""),
+            f"  skipped_no_file: {len(results.get('skipped_no_file', []))}",
             "",
         ]
         self.archilles_dir.mkdir(parents=True, exist_ok=True)
@@ -1294,6 +1372,7 @@ class ZoteroWatchdogScanner:
             'new_indexed_time':    0.0,
             'orphans_found':       [],   # book_ids indexed but gone from the library
             'orphans_removed':     0,
+            'skipped_no_file':     [],   # queued, reached, not indexable (1.15)
             'scanned':             0,
             'interrupted':         False,
         }
@@ -1415,7 +1494,9 @@ class ZoteroWatchdogScanner:
                 data = zotero_items.get(key, {})
                 file_path = adapter.get_file_path(key)
                 if not file_path:
-                    logger.warning("No file found for Zotero key %s — skipping delta update", key)
+                    _record_unindexable(
+                        results, adapter, key, data.get('title', ''), "phase 2",
+                    )
                     continue
                 print(f"\n[{i}/{total_p2}] {data.get('title', key)}")
                 try:
@@ -1472,6 +1553,10 @@ class ZoteroWatchdogScanner:
                     key = entry['doc_id']
                     file_path = adapter.get_file_path(key)
                     if not file_path:
+                        # Counted and explained, not skipped in silence (1.15).
+                        _record_unindexable(
+                            results, adapter, key, entry.get('title', ''), "phase 3",
+                        )
                         continue
                     print(f"\n[{j}/{total_p3}] {entry['title']}")
                     try:
@@ -1494,6 +1579,12 @@ class ZoteroWatchdogScanner:
 
         results['total_time'] = round(time.time() - t0, 1)
         results['interrupted'] = self._shutdown_requested
+
+        # Grouped by reason (1.15). This is the scanner where it matters most:
+        # 199 review items were dropped here silently for two months.
+        unindexable = summarise_unindexable(results.get('skipped_no_file', []))
+        if unindexable:
+            print("\n" + unindexable)
 
         if not dry_run:
             self._save_annotation_cache()
@@ -1618,6 +1709,7 @@ class ZoteroWatchdogScanner:
             f"  orphans_removed: {results.get('orphans_removed', 0)}"
             + (f" of {len(results.get('orphans_found', []))} {results.get('orphans_found', [])}"
                if results.get('orphans_found') else ""),
+            f"  skipped_no_file: {len(results.get('skipped_no_file', []))}",
             "",
         ]
         self.archilles_dir.mkdir(parents=True, exist_ok=True)

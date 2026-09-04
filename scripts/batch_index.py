@@ -65,7 +65,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -93,6 +93,10 @@ from src.archilles.hardware import detect_hardware
 from src.archilles.profiles import get_profile, list_profiles
 from src.archilles.recipe import IndexRecipe, default_recipe
 from src.archilles.indexer import IndexingCheckpoint
+from src.archilles.external_catchup_guard import (
+    DERIVED_COUNT_LIMIT,
+    check_external_catchup_bound,
+)
 from src.archilles.orphan_guard import (
     ORPHAN_COUNT_LIMIT,
     ORPHAN_SHARE_LIMIT,
@@ -865,7 +869,33 @@ def cleanup_orphans(
     }
 
 
-def discover_pending_external_books(rag, library_path: Path, adapter=None) -> List[Dict[str, Any]]:
+def nominate_external_catchup(store) -> Tuple[set, set]:
+    """Return ``(marked, derived)`` book_ids awaiting an external embed.
+
+    ``marked`` carries the explicit ``pending_external`` flag. ``derived`` is
+    finding 1.2's index-shape term: the marker alone is not the truth, because
+    it is written only under ``mode: full-external`` — a title indexed under
+    ``light`` carries no marker and would be invisible here, yet still waits
+    for its hierarchical re-embed. The index knows it anyway: content chunks
+    without PARENT/CHILD. That term is gated on the index actually holding
+    hierarchical chunks, and the marked half is subtracted so the two sets are
+    disjoint and countable on their own.
+
+    Split out from :func:`discover_pending_external_books` so the size can be
+    bounded before any book is resolved or prepared — the projected scan behind
+    this reads every row's book_id and chunk_type and must not run twice.
+    """
+    marked = store.get_pending_external_book_ids()
+    derived: set = set()
+    if store.has_parent_chunks():
+        derived = store.get_book_ids_without_parent_chunks() - marked
+    return marked, derived
+
+
+def discover_pending_external_books(
+    rag, library_path: Path, adapter=None,
+    nominated: Optional[Tuple[set, set]] = None,
+) -> List[Dict[str, Any]]:
     """Find books marked ``pending_external`` and resolve them to book dicts.
 
     The discovery half of the full-external trickle lifecycle (Hardware-Tiers-V2
@@ -877,21 +907,17 @@ def discover_pending_external_books(rag, library_path: Path, adapter=None) -> Li
     (finding 4.2) have non-numeric ids (Zotero keys, folder ids) — resolve those
     via the adapter's ``list_documents`` instead of dropping them. Any pending id
     that cannot be resolved is logged, never silently discarded (finding 2.7).
+    ``nominated`` accepts an already-computed ``(marked, derived)`` pair so a
+    caller that had to bound the set first (see
+    :func:`archilles.external_catchup_guard.check_external_catchup_bound`)
+    does not pay for the index scan twice.
+
     Returns book dicts ready for batch_prepare; an empty list short-circuits.
     """
-    pending = rag.store.get_pending_external_book_ids()
-
-    # Finding 1.2: the marker alone is not the truth. ``pending_external`` is
-    # written only under ``mode: full-external``; a title indexed under
-    # ``light`` carries no marker and would be invisible here, yet still waits
-    # for its hierarchical re-embed. The index knows it anyway — content
-    # chunks without PARENT/CHILD. Gate that term on the index actually
-    # holding hierarchical chunks, otherwise a deliberately flat library
-    # nominates its whole corpus for a metered run.
-    derived: set = set()
-    if rag.store.has_parent_chunks():
-        derived = rag.store.get_book_ids_without_parent_chunks() - pending
-        pending = pending | derived
+    if nominated is None:
+        nominated = nominate_external_catchup(rag.store)
+    marked, derived = nominated
+    pending = marked | derived
 
     if not pending:
         return []
@@ -900,7 +926,7 @@ def discover_pending_external_books(rag, library_path: Path, adapter=None) -> Li
         # The two halves have very different provenance, and the derived one
         # can be large. Say so before anything expensive starts.
         print(f"  ℹ️  {len(pending)} book(s) awaiting external embedding: "
-              f"{len(pending) - len(derived)} marked pending_external, "
+              f"{len(marked)} marked pending_external, "
               f"{len(derived)} derived from the index (content chunks, no "
               f"PARENT/CHILD — indexed under a non-external mode).")
 
@@ -1727,6 +1753,12 @@ Profiles:
                              f'(>{int(ORPHAN_SHARE_LIMIT * 100)}%% of the index AND '
                              f'>{ORPHAN_COUNT_LIMIT} books). For deliberate bulk deletions; '
                              'a scan that reported errors is still refused.')
+    parser.add_argument('--allow-large-external-catchup', action='store_true',
+                        help='Authorise an external catch-up that exceeds the safety '
+                             f'bound (>{DERIVED_COUNT_LIMIT} books derived from the index '
+                             'shape rather than carrying the pending_external marker). '
+                             'For a deliberate bulk catch-up; the marked half is never '
+                             'bounded.')
     parser.add_argument('--prepare-pending-external', action='store_true',
                         help='Discover books indexed provisionally light (full-external '
                              'mode, marked pending_external) and re-prepare them '
@@ -1898,7 +1930,22 @@ def main():
     # Find provisionally-light books, re-prepare them hierarchically; the user
     # then runs `embed --mode remote` to replace the flat chunks externally.
     if args.prepare_pending_external:
-        books = discover_pending_external_books(rag, library_path, adapter=adapter)
+        # Bound the set before a single book is resolved or parsed: this feeds
+        # a metered external embedding run, and the index-derived half can be
+        # the whole corpus (the has_parent_chunks gate is satisfied by as few
+        # as one hierarchical book).
+        nominated = nominate_external_catchup(rag.store)
+        bound = check_external_catchup_bound(
+            marked_count=len(nominated[0]),
+            derived_count=len(nominated[1]),
+            allow_large=args.allow_large_external_catchup,
+        )
+        if not bound.allowed:
+            print(f"\n   ⛔ {bound.reason}")
+            sys.exit(1)
+        books = discover_pending_external_books(
+            rag, library_path, adapter=adapter, nominated=nominated
+        )
         if not books:
             print("✅ No books awaiting external embedding")
             return

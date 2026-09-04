@@ -42,6 +42,7 @@ import threading
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src import __version__ as ARCHILLES_VERSION
+from src.archilles.stdout_guard import redirect_stdout_to_stderr
 from src.calibre_mcp.server import CalibreMCPServer, create_mcp_tools
 from src.calibre_mcp.unified_server import UnifiedMCPServer, create_unified_tools
 
@@ -138,6 +139,15 @@ def _dispatch_tool(server, tool_name: str, params: dict) -> dict:
     only exist on the legacy server (``get_doublette_tag_instruction``)
     return a structured error in unified mode rather than raising
     AttributeError.
+
+    The call runs with stdout redirected to stderr (review 1.3). stdout is the
+    JSON-RPC channel, and the code behind the tools is shared with the CLI,
+    where printing is correct: the watchdog prints scan progress,
+    ``index_book`` prints per-book lines, ``_cleanup_orphaned_books`` announces
+    a deletion *before* its dry-run return. The service layer wrapped only the
+    search paths, so ``watchdog_scan`` corrupted the stream even in dry-run
+    mode. Guarding here rather than per tool means the next scan-adjacent tool
+    inherits the protection instead of re-opening the hole.
     """
     method_name = TOOL_MAP.get(tool_name)
     if not method_name:
@@ -146,7 +156,8 @@ def _dispatch_tool(server, tool_name: str, params: dict) -> dict:
     if method is None:
         return {'error': f'Tool {tool_name!r} is not available in this server mode'}
     try:
-        return method(**params)
+        with redirect_stdout_to_stderr():
+            return method(**params)
     except Exception as e:
         logger.error(f"Error in tool {tool_name}: {e}", exc_info=True)
         return {'error': str(e)}

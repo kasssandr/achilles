@@ -42,11 +42,17 @@ class TestHasParentChunks:
 
 
 class TestWarnLightPlanHidesHierarchy:
-    def test_warns_on_light_over_hierarchical(self, capsys):
+    def test_warns_on_light_over_hierarchical(self, capsys, caplog):
+        """Logged, not printed (review 1.3): this fires on every scan, and an
+        MCP-driven scan writes JSON-RPC on stdout."""
         store = SimpleNamespace(has_parent_chunks=lambda: True)
-        warned = warn_if_light_plan_hides_hierarchy(SimpleNamespace(mode="light"), store)
+        with caplog.at_level("WARNING"):
+            warned = warn_if_light_plan_hides_hierarchy(
+                SimpleNamespace(mode="light"), store
+            )
         assert warned is True
-        assert "full-external" in capsys.readouterr().out
+        assert "full-external" in caplog.text
+        assert capsys.readouterr().out == ""
 
     def test_silent_when_plan_not_light(self, capsys):
         store = SimpleNamespace(has_parent_chunks=lambda: True)

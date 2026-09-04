@@ -24,11 +24,14 @@ the plan is a later stage (§10.3/§10.4).
 
 See docs/internal/CONCEPT_2026-06-23_HARDWARE_TIERS_V2.md (§3, §4, §6, §9).
 """
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
 from src.archilles.hardware import HardwareClass, HardwareProfile, classify_hardware
 from src.archilles.recipe import IndexRecipe
+
+logger = logging.getLogger(__name__)
 
 Mode = Literal["auto", "light", "full-local", "full-external"]
 
@@ -134,6 +137,11 @@ def warn_if_light_plan_hides_hierarchy(execution_plan: "ExecutionPlan", store) -
     quality with no ``pending_external`` upgrade queue. Setting
     ``"mode": "full-external"`` restores the marked-and-upgradable path.
 
+    Logged, not printed (review 1.3): this fires on *every* scan in this
+    library, including scans driven by the MCP server, where stdout carries
+    JSON-RPC. A library-layer function has no business writing to stdout — the
+    CLI sees this through logging like every other warning.
+
     Returns True if it warned. Never raises — a store hiccup just skips the hint.
     """
     if execution_plan is None or execution_plan.mode != "light":
@@ -143,13 +151,12 @@ def warn_if_light_plan_hides_hierarchy(execution_plan: "ExecutionPlan", store) -
             return False
     except Exception:
         return False
-    print(
-        "⚠️  This index already contains hierarchical (parent) chunks, but the "
-        "resolved mode is 'light'.\n"
-        "    New titles will be indexed FLAT and unmarked — searchable, but "
-        "silently lower quality,\n"
-        "    with no pending_external upgrade queue. If your corpus was embedded "
-        "externally, set\n"
-        '    "mode": "full-external" in this library\'s .archilles/config.json.'
+    logger.warning(
+        "This index already contains hierarchical (parent) chunks, but the "
+        "resolved mode is 'light'. New titles will be indexed FLAT and "
+        "unmarked — searchable, but silently lower quality, with no "
+        "pending_external upgrade queue. If your corpus was embedded "
+        'externally, set "mode": "full-external" in this library\'s '
+        ".archilles/config.json."
     )
     return True

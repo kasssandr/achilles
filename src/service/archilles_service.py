@@ -18,14 +18,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 from src.archilles.constants import ChunkType, SectionType
+from src.archilles.stdout_guard import redirect_stdout_to_stderr
 from src.retriever.results import diversify_results, matches_tag_filter  # noqa: F401  (Re-Export — Alt-Abnehmer importieren von hier)
 
 logger = logging.getLogger(__name__)
 
-
-_redirect_lock = threading.Lock()
-_redirect_depth = 0
-_redirect_original_stdout: Any = None
+# The guard now lives in src/archilles/stdout_guard.py so mcp_server.py can wrap
+# the whole tool dispatch with it (review 1.3) without importing this module.
+# Both must share one refcount — two would race — hence the alias rather than a
+# second implementation.
+_redirect_stdout_to_stderr = redirect_stdout_to_stderr
 
 
 # Serialises embedding-/reranker-model construction across ALL service instances.
@@ -57,33 +59,6 @@ def _get_shared_reranker(model_name: str | None, device: str | None):
         reranker = CrossEncoderReranker(model_name=model_name, device=device)
         _shared_rerankers[key] = reranker
     return reranker
-
-
-@contextmanager
-def _redirect_stdout_to_stderr():
-    """Temporarily redirect stdout to stderr (prevents MCP JSON-RPC corruption).
-
-    Thread-safe via refcount: the first concurrent enter captures and replaces
-    sys.stdout under a lock; subsequent enters increment the counter without
-    touching sys.stdout. The original is restored only when the last holder
-    exits. This keeps cross-source fan-out parallelism intact while preventing
-    the save/restore race that previously could leave stdout permanently
-    pointed at stderr.
-    """
-    global _redirect_depth, _redirect_original_stdout
-    with _redirect_lock:
-        if _redirect_depth == 0:
-            _redirect_original_stdout = sys.stdout
-            sys.stdout = sys.stderr
-        _redirect_depth += 1
-    try:
-        yield
-    finally:
-        with _redirect_lock:
-            _redirect_depth -= 1
-            if _redirect_depth == 0:
-                sys.stdout = _redirect_original_stdout
-                _redirect_original_stdout = None
 
 
 def _filter_by_rerank_score(results: list[dict], min_similarity: float) -> list[dict]:

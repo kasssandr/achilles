@@ -49,7 +49,15 @@ class DocumentMetadata:
 
 @dataclass
 class DocumentAnnotation:
-    """A single annotation (highlight, note, bookmark)."""
+    """A single annotation (highlight, note, bookmark).
+
+    ``source`` names the tool the annotation came from — ``calibre_viewer``,
+    ``pdf``, ``zotero``, ``kindle`` — and is finer-grained than the adapter it
+    arrived through: one Calibre book can carry both viewer highlights and
+    PDF-embedded ones. It reaches the index as ``annotation_source`` on the
+    chunk. Without it the round trip through this type was lossy, which is why
+    the indexer used to route Calibre around the adapter entirely (finding 1.4).
+    """
 
     text: str
     note: str = ""
@@ -57,6 +65,7 @@ class DocumentAnnotation:
     page: int | None = None
     chapter: str = ""
     created: str = ""
+    source: str = ""
 
 
 class SourceAdapter(ABC):

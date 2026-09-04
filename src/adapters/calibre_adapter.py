@@ -17,6 +17,9 @@ from src.adapters.base import (
 )
 from src.archilles.sqlite_ro import connect_readonly
 from src.calibre_db import CalibreDB
+from src.calibre_mcp.annotations import (
+    get_combined_annotations as _calibre_get_combined_annotations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -186,14 +189,27 @@ class CalibreAdapter(SourceAdapter):
         return self._find_primary_file(row["path"])
 
     def get_annotations(self, doc_id: str) -> list[DocumentAnnotation]:
+        """Calibre-viewer highlights plus PDF-embedded annotations.
+
+        The filter arguments are not defaults and must not become defaults:
+        ``min_length`` and ``exclude_toc_markers`` decide which annotations
+        exist at all, and therefore the book's annotation hash. They match what
+        the indexer passed when it still called ``get_combined_annotations``
+        directly, which is what makes this route equivalent to that one — the
+        reason the indexer no longer needs a Calibre special case (finding 1.4).
+        Change them and every Calibre book re-indexes.
+        """
         file_path = self.get_file_path(doc_id)
         if not file_path:
             return []
 
         try:
-            from src.calibre_mcp.annotations import get_combined_annotations
-
-            result = get_combined_annotations(str(file_path))
+            result = _calibre_get_combined_annotations(
+                book_path=str(file_path),
+                include_pdf=True,
+                exclude_toc_markers=True,
+                min_length=20,
+            )
             annotations = result.get("annotations", [])
             return [
                 DocumentAnnotation(
@@ -202,6 +218,7 @@ class CalibreAdapter(SourceAdapter):
                     annotation_type=a.get("type", "highlight"),
                     page=a.get("page"),
                     created=a.get("timestamp", ""),
+                    source=a.get("source", ""),
                 )
                 for a in annotations
             ]

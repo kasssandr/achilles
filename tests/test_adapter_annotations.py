@@ -134,18 +134,11 @@ class TestNonCalibreGoesThroughTheAdapter:
         assert legacy.calls == []
 
 
-class TestCalibrePathIsUnchanged:
-    """The reindex-storm gate: same reader, same arguments, same output."""
-
-    def test_calibre_adapter_still_uses_the_legacy_reader(self, legacy):
-        adapter = _Adapter("calibre", [DocumentAnnotation(text="would differ")])
-        result = _indexer(adapter)._resolve_annotations("42", "/book.epub")
-
-        assert adapter.calls == [], "routing Calibre through the adapter re-hashes the library"
-        assert len(legacy.calls) == 1
-        assert result == [{"highlighted_text": "legacy highlight",
-                           "notes": "legacy note", "type": "highlight",
-                           "page": 12, "source": "calibre_viewer"}]
+class TestLegacyReaderServesTheAdapterlessPath:
+    """The direct reader survives for setups constructed without an adapter.
+    Its arguments are the reindex-storm gate: they must match what
+    CalibreAdapter.get_annotations passes, or the two routes disagree about
+    which annotations exist."""
 
     def test_no_adapter_uses_the_legacy_reader(self, legacy):
         result = _indexer(None)._resolve_annotations("42", "/book.epub")
@@ -330,3 +323,110 @@ class TestZoteroAdapterCarriesTypeAndPage:
         assert annots[0].annotation_type == "highlight"
         assert annots[0].page is None
         assert annots[0].text == "Marcion of Sinope"
+
+
+# ── one route for every source (user decision 2026-09-04) ────────────
+
+class TestCalibreGoesThroughTheAdapterToo:
+    """The Calibre exception is gone: instead of routing around the adapter,
+    the adapter was made equivalent. `source` is now part of DocumentAnnotation
+    and CalibreAdapter passes the indexer's filter arguments, so the adapter
+    route yields byte-identical annotations — no reindex, no special case.
+
+    ARCHILLES is meant to be used by other people; a permanent "except for
+    Calibre" in the abstraction is the shape that produced findings 1.4 and
+    1.15 in the first place.
+    """
+
+    LEGACY_ROWS = [
+        {"highlighted_text": "a highlight", "notes": "a note",
+         "type": "highlight", "page": 12, "source": "calibre_viewer",
+         "timestamp": "2026-01-02T03:04:05"},
+        {"highlighted_text": "from the pdf", "notes": "",
+         "type": "underline", "page": 3, "source": "pdf"},
+        {"highlighted_text": "", "notes": "note without highlight",
+         "type": "note", "source": "calibre_viewer"},
+    ]
+
+    def test_round_trip_through_the_adapter_loses_nothing(self, monkeypatch, tmp_path):
+        """The equivalence the decision rests on, asserted rather than assumed:
+        every field the indexer reads survives dict -> DocumentAnnotation ->
+        dict."""
+        from src.adapters import calibre_adapter as ca
+
+        monkeypatch.setattr(
+            ca, "_calibre_get_combined_annotations",
+            lambda **kwargs: {"annotations": list(self.LEGACY_ROWS)},
+            raising=False,
+        )
+        adapter = ca.CalibreAdapter.__new__(ca.CalibreAdapter)
+        monkeypatch.setattr(type(adapter), "get_file_path",
+                            lambda self, doc_id: tmp_path / "b.epub")
+
+        doc_annots = adapter.get_annotations("42")
+        idx = _indexer(_Adapter("calibre", doc_annots))
+        # Route it the same way the indexer does for any adapter.
+        mapped = idx._map_adapter_annotations(doc_annots, "calibre")
+
+        for original, produced in zip(self.LEGACY_ROWS, mapped):
+            for field in ("highlighted_text", "notes", "type", "source"):
+                assert produced[field] == original.get(field, ""), field
+            assert produced["page"] == original.get("page")
+
+    def test_adapter_uses_the_indexers_filter_arguments(self, monkeypatch, tmp_path):
+        """min_length and exclude_toc_markers decide which annotations exist.
+        Different arguments here would mean different annotation hashes — the
+        reindex the equivalence is meant to avoid."""
+        from src.adapters import calibre_adapter as ca
+
+        seen = {}
+
+        def spy(**kwargs):
+            seen.update(kwargs)
+            return {"annotations": []}
+
+        monkeypatch.setattr(ca, "_calibre_get_combined_annotations", spy,
+                            raising=False)
+        adapter = ca.CalibreAdapter.__new__(ca.CalibreAdapter)
+        monkeypatch.setattr(type(adapter), "get_file_path",
+                            lambda self, doc_id: tmp_path / "b.epub")
+
+        adapter.get_annotations("42")
+
+        assert seen["include_pdf"] is True
+        assert seen["exclude_toc_markers"] is True
+        assert seen["min_length"] == 20
+
+    def test_indexer_no_longer_special_cases_calibre(self, legacy):
+        """A Calibre adapter is used like any other."""
+        adapter = _Adapter("calibre", [
+            DocumentAnnotation(text="from the adapter", note="",
+                               annotation_type="highlight", page=5,
+                               source="calibre_viewer"),
+        ])
+        result = _indexer(adapter)._resolve_annotations("42", "/book.epub")
+
+        assert adapter.calls == ["42"], "the adapter must be asked, like every source"
+        assert legacy.calls == [], "no second route around it"
+        assert result[0]["source"] == "calibre_viewer"
+        assert result[0]["page"] == 5
+
+    def test_adapterless_path_is_the_only_fallback(self, legacy):
+        """Legacy setups without an adapter still work — that path is
+        unchanged and is now the *only* direct use of the old reader."""
+        result = _indexer(None)._resolve_annotations("42", "/book.epub")
+
+        assert len(legacy.calls) == 1
+        assert result[0]["source"] == "calibre_viewer"
+
+    def test_adapter_source_wins_over_the_adapter_type(self, legacy):
+        """"calibre_viewer" and "pdf" are finer than "calibre" and must not be
+        flattened; the adapter type only fills in when a source is absent."""
+        adapter = _Adapter("zotero", [
+            DocumentAnnotation(text="x", source=""),
+            DocumentAnnotation(text="y", source="explicit"),
+        ])
+        result = _indexer(adapter)._resolve_annotations("K", "/x.pdf")
+
+        assert result[0]["source"] == "zotero"
+        assert result[1]["source"] == "explicit"

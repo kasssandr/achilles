@@ -270,40 +270,36 @@ class Indexer:
         still fires, triggers a re-index, counts a delta update and exits 0.
         The highlights the project's USP rests on were never indexed.
 
-        Non-Calibre sources therefore go through ``adapter.get_annotations``,
-        mapped onto the legacy dict shape ``_build_annotation_chunks`` expects.
+        **Every** source goes through ``adapter.get_annotations`` — Calibre
+        included. That is deliberate and was a design decision (user,
+        2026-09-04): a permanent "except for Calibre" in the adapter
+        abstraction is the very shape that produced this finding, and ARCHILLES
+        is meant to be used by people whose library is not this one.
 
-        **Calibre keeps the legacy reader**, and that is not an oversight:
-        ``CalibreAdapter.get_annotations`` calls the same function with
-        *different* arguments (no ``include_pdf``/``exclude_toc_markers``/
-        ``min_length``) and drops ``source`` when it maps into
-        ``DocumentAnnotation``. Routing Calibre through the adapter would
-        change which annotations exist and therefore every annotation hash —
-        a re-index of the whole library. This is the reindex-storm gate.
+        Routing Calibre through the adapter is free of a re-index because
+        ``CalibreAdapter.get_annotations`` was made *equivalent* to the call
+        this method used to make, rather than being routed around: it passes
+        the same filter arguments, and ``DocumentAnnotation`` carries ``source``
+        so the round trip loses nothing. ``tests/test_adapter_annotations.py``
+        pins both halves; without them the annotation hashes shift and the
+        whole library re-indexes.
 
-        A failing adapter yields no annotations rather than falling back to the
-        Calibre reader: for a Zotero item that reader would return an empty
-        list anyway, and a silent fallback would hide the failure.
+        The direct reader remains only for the adapterless legacy path.
+
+        A failing adapter yields no annotations rather than falling back:
+        a silent fallback would hide the failure, and for a Zotero item the
+        Calibre reader would return an empty list anyway.
         """
         adapter = getattr(self._rag, "_adapter", None)
-        adapter_type = getattr(adapter, "adapter_type", "calibre")
-        if adapter is not None and adapter_type != "calibre" and book_id:
+        if adapter is not None and book_id:
             try:
                 doc_annotations = adapter.get_annotations(str(book_id))
             except Exception as exc:
                 print(f"  ⚠️  adapter annotations failed for {book_id}: {exc}")
                 return []
-            return [
-                {
-                    'highlighted_text': a.text or '',
-                    'notes': a.note or '',
-                    'type': a.annotation_type or 'highlight',
-                    'page': a.page,
-                    'source': adapter_type,
-                    'timestamp': a.created or '',
-                }
-                for a in doc_annotations
-            ]
+            return self._map_adapter_annotations(
+                doc_annotations, getattr(adapter, "adapter_type", ""),
+            )
 
         try:
             result = get_combined_annotations(
@@ -315,6 +311,26 @@ class Indexer:
             return result.get('annotations', [])
         except Exception:
             return []
+
+    @staticmethod
+    def _map_adapter_annotations(doc_annotations, adapter_type: str) -> List[Dict[str, Any]]:
+        """``DocumentAnnotation`` → the dict shape the chunk builders read.
+
+        ``source`` is finer than the adapter type — one Calibre book can carry
+        both ``calibre_viewer`` and ``pdf`` annotations — so the adapter's own
+        value wins and the type only fills in when it is absent.
+        """
+        return [
+            {
+                'highlighted_text': a.text or '',
+                'notes': a.note or '',
+                'type': a.annotation_type or 'highlight',
+                'page': a.page,
+                'source': getattr(a, 'source', '') or adapter_type,
+                'timestamp': a.created or '',
+            }
+            for a in doc_annotations
+        ]
 
     @staticmethod
     def _build_annotation_text(annot: Dict[str, Any]) -> str:

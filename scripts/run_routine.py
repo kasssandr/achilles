@@ -127,6 +127,28 @@ def _build_command(
     ]
 
 
+def _derive_intent(cmd: list[str]) -> dict[str, bool]:
+    """What the run was *asked* to do, read back from the command just built.
+
+    The history record stores what a run did and never what it was asked to
+    do, which is why "0 indexed" cannot be told apart from "nothing to index"
+    (review 1.10a). Derived from the finished command rather than from
+    _build_command's branch conditions, so it cannot drift away from what was
+    actually executed.
+
+    It also makes the Calibre phase visible in the history for the first time:
+    phase A carries index_metadata_only, phase B index_fulltext_pending.
+    """
+    flags = set(cmd)
+    return {
+        # batch_index's "--all --skip-existing" expresses the same intent as
+        # --index-new: take in everything that is not in the index yet.
+        "index_new": "--index-new" in flags or "--skip-existing" in flags,
+        "index_metadata_only": "--index-metadata-only" in flags,
+        "index_fulltext_pending": "--index-fulltext-pending" in flags,
+    }
+
+
 def _parse_stats(stdout: str, adapter: str) -> dict:
     """Best-effort extraction of counters from tool stdout."""
     if adapter in ("calibre", "zotero"):
@@ -389,6 +411,7 @@ def main() -> int:
                 "adapter": adapter, "frequency": args.frequency,
                 "exit_code": -1, "duration_s": duration,
                 "error": "timeout (>8h)", "stats": {},
+                "intent": _derive_intent(cmd),
             }
             _append_history(history_file, record)
             return 124
@@ -426,7 +449,7 @@ def main() -> int:
             "timestamp": start.isoformat(), "source": args.source,
             "adapter": adapter, "frequency": args.frequency,
             "exit_code": returncode, "duration_s": round(duration, 1),
-            "stats": stats,
+            "stats": stats, "intent": _derive_intent(cmd),
         }
         _append_history(history_file, record)
 

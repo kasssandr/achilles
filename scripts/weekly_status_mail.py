@@ -124,6 +124,54 @@ def _format_linker_block(library: Path, rows: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Sources whose runs go through scripts/watchdog.py and therefore share one
+# stat shape (new_books/new_indexed/…), as opposed to batch_index.py's
+# indexed/skipped/failed.
+WATCHDOG_ADAPTERS = ("calibre", "zotero")
+
+
+def _standstills(rows: list[dict], agg, peak) -> list[str]:
+    """Weeks in which the routine was asked to index and took in nothing.
+
+    Reads the ``intent`` record written by run_routine (review 1.10a). Runs
+    from before that record existed carry no intent; those are left unflagged
+    rather than guessed at — an unclassifiable run must not raise an alarm.
+
+    The two axes are checked separately on purpose. One combined sum would
+    hide the case that is actually live here: phase A takes in its handful of
+    new stubs every day, so a phase B that has drained nothing since May would
+    never reach zero and never be flagged.
+
+    The counts name the *queue* ("0 of 520 waiting"), not the week's sum of
+    sightings printed above: those two are the same backlog seen seven times,
+    and putting "520" next to a summed "1040" in one block would read as a
+    contradiction.
+
+    ``delta_updates`` deliberately does not count as progress on the new-title
+    axis, against the letter of the review's fix shape. Replayed against the
+    real Zotero records of 2026-06-30 and 2026-07-01 — the very runs the review
+    names as its motivating case — the combined condition stays silent: those
+    runs saw 520 new items, took in none, and carried 21 delta updates, which
+    would have excused the standstill. A metadata change on a book already in
+    the index says the run was not dead; it says nothing about the queue.
+    """
+    intents = [r.get("intent") or {} for r in rows]
+    wanted = lambda k: any(i.get(k) for i in intents)
+
+    out: list[str] = []
+    if (wanted("index_new") or wanted("index_metadata_only"))             and agg("new_indexed") == 0             and peak("new_books") > 0:
+        out.append(
+            f"Stillstand: 0 von zuletzt {peak('new_books')} wartenden neuen "
+            f"Titeln aufgenommen — der Lauf sollte indexieren"
+        )
+    if wanted("index_fulltext_pending")             and agg("fulltext_indexed") == 0             and peak("fulltext_pending") > 0:
+        out.append(
+            f"Stillstand: 0 von zuletzt {peak('fulltext_pending')} wartenden "
+            f"Volltexten aufgenommen — der Lauf sollte indexieren"
+        )
+    return out
+
+
 def _format_source_block(name: str, adapter: str, library: Path, rows: list[dict]) -> str:
     lines = [f"  {name}  (adapter: {adapter}, lib: {library})"]
     if not rows:
@@ -134,16 +182,34 @@ def _format_source_block(name: str, adapter: str, library: Path, rows: list[dict
     failures  = [r for r in rows if r.get("exit_code") != 0]
     lines.append(f"    Läufe: {len(rows)}  (erfolg: {len(successes)}, fehler: {len(failures)})")
 
-    if adapter == "calibre":
-        agg = lambda k: sum((r.get("stats", {}) or {}).get(k, 0) or 0 for r in rows)
+    agg = lambda k: sum((r.get("stats", {}) or {}).get(k, 0) or 0 for r in rows)
+    # Queue sizes are per-run snapshots of the *same* backlog, so summing them
+    # multiplies one backlog by the number of runs. Take the peak instead.
+    peak = lambda k: max(
+        [(r.get("stats", {}) or {}).get(k, 0) or 0 for r in rows] or [0]
+    )
+
+    # Branch on the stat shape, not on "calibre": the Zotero watchdog writes
+    # the same keys, so the old else-branch looked up indexed/skipped/failed
+    # on a Zotero record and printed three permanent zeros.
+    if adapter in WATCHDOG_ADAPTERS:
         lines.append(
             f"    Neue Bücher: {agg('new_books')}  |  "
             f"Metadaten: {agg('metadata_changed')}  |  "
             f"Annotationen: {agg('annotations_changed')}  |  "
             f"Delta-Updates: {agg('delta_updates')}"
         )
+        # What the week actually took in. Without these the July pattern is
+        # invisible: a routine that saw 523 new titles and indexed none reads
+        # exactly like one that had nothing to do (review 1.10b).
+        lines.append(
+            f"    Aufgenommen: neu {agg('new_indexed')}  |  "
+            f"Volltext {agg('fulltext_indexed')}  |  "
+            f"Fehler: {agg('errors')}"
+        )
+        for stall in _standstills(rows, agg, peak):
+            lines.append(f"    ⚠️  {stall}")
     else:
-        agg = lambda k: sum((r.get("stats", {}) or {}).get(k, 0) or 0 for r in rows)
         lines.append(
             f"    Indexiert: {agg('indexed')}  |  "
             f"übersprungen: {agg('skipped')}  |  "

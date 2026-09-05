@@ -41,7 +41,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.archilles import runtime_lock
+from src.archilles import process_lifetime, runtime_lock
 from src.archilles.config import load_master_config
 
 
@@ -365,6 +365,12 @@ def main() -> int:
                 stdout=subprocess.PIPE, stderr=None,
                 text=True, encoding="utf-8", bufsize=1,
             )
+            # Closing this routine's console window terminates us without
+            # running the finally below, and the child is the process
+            # actually holding the GPU.  Tie its lifetime to ours so the
+            # kernel cleans it up; an orphan here keeps VRAM the lock
+            # believes to be free.
+            process_lifetime.tie_child_to_parent(proc.pid)
         except OSError as e:
             log_handle.write(f"FEHLER beim Start: {e}\n")
             log_handle.close()

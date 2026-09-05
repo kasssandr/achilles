@@ -276,6 +276,116 @@ class TestCrashRecovery:
         assert runtime_lock.acquire("new-owner", wait_s=0) is True
         assert "new-owner" in _isolated_lockfile.read_text(encoding="utf-8")
 
+    def test_reclaims_when_pid_was_recycled_within_the_clock_margin(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Regression: after a reboot the OS reuses a dead holder's PID
+        within seconds, so a start time that merely lies "well after" the
+        lock proves nothing.  The recorded ``start`` field settles it —
+        without it, four routines once waited out a full STALE_AFTER_S
+        hour behind a holder that had been dead all along."""
+        runtime_lock.acquire("holder")
+        info = _isolated_lockfile.read_text(encoding="utf-8")
+        holder_start = runtime_lock._parse_start(info)
+        assert holder_start is not None, "acquire() must record start="
+
+        # Same PID, but a process that came up 58s later — as the svchost
+        # that inherited PID 21888 on 2026-09-05 did.
+        monkeypatch.setattr(runtime_lock, "_pid_is_alive", lambda pid: True)
+        monkeypatch.setattr(
+            runtime_lock, "_pid_start_time", lambda pid: holder_start + 58,
+        )
+
+        assert runtime_lock.acquire("new-owner", wait_s=0) is True
+        assert "new-owner" in _isolated_lockfile.read_text(encoding="utf-8")
+
+    def test_matching_start_time_keeps_the_lock(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The mirror case: same PID, same creation time — that really is
+        the holder, and it keeps its lock."""
+        runtime_lock.acquire("holder")
+        holder_start = runtime_lock._parse_start(
+            _isolated_lockfile.read_text(encoding="utf-8")
+        )
+        monkeypatch.setattr(runtime_lock, "_pid_is_alive", lambda pid: True)
+        monkeypatch.setattr(
+            runtime_lock, "_pid_start_time", lambda pid: holder_start,
+        )
+
+        assert runtime_lock.acquire("intruder", wait_s=0) is False
+        assert "holder" in _isolated_lockfile.read_text(encoding="utf-8")
+
+    def test_unreadable_start_time_keeps_the_lock(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A recorded start we cannot compare against is not evidence of
+        death — the mtime rule stays the backstop."""
+        runtime_lock.acquire("holder")
+        monkeypatch.setattr(runtime_lock, "_pid_is_alive", lambda pid: True)
+        monkeypatch.setattr(runtime_lock, "_pid_start_time", lambda pid: None)
+
+        assert runtime_lock.acquire("intruder", wait_s=0) is False
+
+    def test_legacy_lock_reclaimed_when_image_is_not_python(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Lockfiles written before the ``start`` field existed still get
+        the weaker check: every tenant is a Python script, so a PID now
+        running something else has been recycled."""
+        _isolated_lockfile.write_text(
+            f"old(routine)  PID=4242  since={datetime.now().isoformat()}",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(runtime_lock, "_pid_is_alive", lambda pid: True)
+        monkeypatch.setattr(
+            runtime_lock, "_pid_image_is_python", lambda pid: False,
+        )
+
+        assert runtime_lock.acquire("new-owner", wait_s=0) is True
+        assert "new-owner" in _isolated_lockfile.read_text(encoding="utf-8")
+
+    def test_legacy_lock_kept_when_image_is_unreadable(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """An image name we cannot read proves nothing — keep the lock."""
+        _isolated_lockfile.write_text(
+            f"old(routine)  PID=4242  since={datetime.now().isoformat()}",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(runtime_lock, "_pid_is_alive", lambda pid: True)
+        monkeypatch.setattr(
+            runtime_lock, "_pid_image_is_python", lambda pid: None,
+        )
+        monkeypatch.setattr(runtime_lock, "_pid_start_time", lambda pid: None)
+
+        assert runtime_lock.acquire("intruder", wait_s=0) is False
+
+    def test_lock_line_records_our_own_start_time(
+        self, _isolated_lockfile: Path,
+    ):
+        """The recorded start must be this interpreter's real creation
+        time, otherwise the identity check compares noise."""
+        psutil = pytest.importorskip("psutil")
+        runtime_lock.acquire("self-test")
+        recorded = runtime_lock._parse_start(
+            _isolated_lockfile.read_text(encoding="utf-8")
+        )
+        assert recorded is not None
+        actual = psutil.Process(os.getpid()).create_time()
+        assert abs(recorded - actual) <= runtime_lock._START_TIME_EPSILON_S
+
+    def test_lock_line_without_psutil_omits_start(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Without psutil the field is simply absent and the legacy path
+        applies — writing a bogus value would be worse than none."""
+        monkeypatch.setattr(runtime_lock, "psutil", None)
+        runtime_lock.acquire("no-psutil")
+        info = _isolated_lockfile.read_text(encoding="utf-8")
+        assert "start=" not in info
+        assert runtime_lock._parse_start(info) is None
+
     def test_unparseable_lockfile_is_left_to_the_mtime_rule(
         self, _isolated_lockfile: Path,
     ):

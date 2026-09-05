@@ -9,8 +9,9 @@ future tenants like the news agent.
 Design
 ------
 * **Lockfile content:** a short human-readable line ``"{script_name}  PID=…
-  since=ISO"``.  Reading it shows you which automation currently holds the
-  lock and since when.
+  since=ISO  start=EPOCH"``.  Reading it shows you which automation
+  currently holds the lock and since when; ``start`` is the holder
+  process' own creation timestamp and exists to identify it exactly.
 * **Heartbeat:** a daemon thread refreshes the lockfile's mtime every
   :data:`HEARTBEAT_INTERVAL_S` seconds via ``os.utime`` (atomic — never
   recreates a stray file if the lock was just released).
@@ -20,11 +21,13 @@ Design
 * **Liveness recovery:** waiting out a full hour is wasteful when the
   holder is *provably* gone, so :func:`acquire` additionally reclaims a
   lock whose recorded holder cannot exist any more — its mtime predates
-  the last boot (hard reboot), or its PID is dead, or the PID was
-  recycled by a process that started after the lock was written.  This
-  check may only release a lock *earlier* than the mtime rule would, and
-  never holds one longer: a hung-but-alive holder still loses its lock
-  after :data:`STALE_AFTER_S`.
+  the last boot (hard reboot), its PID is dead, or the PID has been
+  recycled.  Recycling is decided by comparing the live process'
+  creation time against the ``start`` field: any mismatch proves a
+  different process, however soon after the lock the recycling
+  happened.  This check may only release a lock *earlier* than the mtime
+  rule would, and never holds one longer: a hung-but-alive holder still
+  loses its lock after :data:`STALE_AFTER_S`.
 * **Wait-and-poll:** acquirers pass ``wait_s`` to wait for a busy lock to
   free up.  Scheduled tasks pass 2 h so OnLogon triggers serialise rather
   than skip the day.
@@ -105,8 +108,19 @@ _POLL_INTERVAL_S: int = 300
 #: the stdlib boot-time fallback, so we never declare a live holder dead.
 _CLOCK_MARGIN_S: int = 120
 
+#: How far two readings of the same process' creation time may differ
+#: before we call them different processes.  The kernel reports a stable
+#: value, so this only absorbs the rounding of writing it to the lockfile.
+_START_TIME_EPSILON_S: float = 1.0
+
 _PID_RE = re.compile(r"PID=(\d+)")
 _SINCE_RE = re.compile(r"since=(\S+)")
+_START_RE = re.compile(r"start=(\d+(?:\.\d+)?)")
+
+#: Every tenant of this lock is a Python script (see module docstring), so
+#: a PID running some other image cannot be a holder.  Only used for
+#: legacy lockfiles that predate the ``start`` field.
+_PYTHON_IMAGE_RE = re.compile(r"^python", re.IGNORECASE)
 
 
 # ── Holder liveness ─────────────────────────────────────────────────────
@@ -151,6 +165,21 @@ def _pid_start_time(pid: int) -> float | None:
         return None
 
 
+def _pid_image_is_python(pid: int) -> bool | None:
+    """Whether ``pid`` runs a Python interpreter.
+
+    Returns ``None`` when the image name cannot be read — an unknown
+    holder must never be treated as dead.
+    """
+    if psutil is None:
+        return None
+    try:
+        name = psutil.Process(pid).name()
+    except Exception:
+        return None
+    return bool(_PYTHON_IMAGE_RE.match(name))
+
+
 def _parse_since(info: str) -> float | None:
     """Timestamp from the lockfile's ``since=`` field, if parseable."""
     m = _SINCE_RE.search(info)
@@ -160,6 +189,37 @@ def _parse_since(info: str) -> float | None:
         return datetime.fromisoformat(m.group(1)).timestamp()
     except ValueError:
         return None
+
+
+def _parse_start(info: str) -> float | None:
+    """Holder creation timestamp from the lockfile's ``start=`` field.
+
+    ``None`` for lockfiles written before the field existed.
+    """
+    m = _START_RE.search(info)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _lock_line(script_name: str) -> str:
+    """The line written into the lockfile by :func:`acquire`.
+
+    ``start`` is omitted when our own creation time is unreadable; the
+    resulting lockfile then falls back to the legacy recycling checks.
+    """
+    parts = [
+        script_name,
+        f"PID={os.getpid()}",
+        f"since={datetime.now().isoformat()}",
+    ]
+    own_start = _pid_start_time(os.getpid())
+    if own_start is not None:
+        parts.append(f"start={own_start:.3f}")
+    return "  ".join(parts)
 
 
 def _holder_is_gone(info: str, mtime: float) -> bool:
@@ -183,10 +243,26 @@ def _holder_is_gone(info: str, mtime: float) -> bool:
     if not _pid_is_alive(pid):
         return True  # crashed without releasing, no reboot involved
 
-    # The PID exists, but PIDs get recycled: a process that started after
-    # the lock was written cannot be the holder we are looking at.
-    since = _parse_since(info)
+    # The PID exists, but PIDs get recycled.  With a recorded start time we
+    # can settle it exactly: the same PID showing a different creation time
+    # is a different process, no matter how little time passed.
     started = _pid_start_time(pid)
+    recorded_start = _parse_start(info)
+    if recorded_start is not None:
+        if started is None:
+            return False  # nothing to compare against — assume alive
+        return abs(started - recorded_start) > _START_TIME_EPSILON_S
+
+    # Legacy lockfile without ``start``.  Two weaker signals remain: the
+    # image at that PID cannot be a holder if it is not Python at all, and
+    # a process that started well after the lock was written cannot have
+    # written it.  Both miss a recycle that happens within
+    # _CLOCK_MARGIN_S of the lock by an unreadable process — such a lock
+    # still waits out STALE_AFTER_S.
+    if _pid_image_is_python(pid) is False:
+        return True
+
+    since = _parse_since(info)
     if since is not None and started is not None:
         if started > since + _CLOCK_MARGIN_S:
             return True
@@ -252,10 +328,7 @@ def acquire(script_name: str, wait_s: int = 0) -> bool:
 
         if not busy:
             LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-            LOCK_FILE.write_text(
-                f"{script_name}  PID={os.getpid()}  since={datetime.now().isoformat()}",
-                encoding="utf-8",
-            )
+            LOCK_FILE.write_text(_lock_line(script_name), encoding="utf-8")
             return True
 
         if time.time() >= deadline:

@@ -349,8 +349,56 @@ def acquire(script_name: str, wait_s: int = 0) -> bool:
         time.sleep(_POLL_INTERVAL_S)
 
 
+def _lock_is_ours(info: str) -> bool:
+    """Whether the lockfile's recorded holder is this very process.
+
+    Conservative in the opposite direction from :func:`_holder_is_gone`:
+    an uncertain answer is ``False``, so :func:`release` leaves behind a
+    lockfile it cannot prove to be its own.  Nothing is lost by that —
+    once we exit, our PID is dead and the liveness check in
+    :func:`acquire` reclaims the lock immediately.
+    """
+    m = _PID_RE.search(info)
+    if not m or int(m.group(1)) != os.getpid():
+        return False
+
+    # Same PID, but a lockfile written before we existed would carry a
+    # different creation time.  Compare when both sides are readable.
+    recorded_start = _parse_start(info)
+    if recorded_start is None:
+        return True  # legacy lockfile — the PID match is all we have
+    own_start = _pid_start_time(os.getpid())
+    if own_start is None:
+        return True  # nothing to compare against — the PID match stands
+    return abs(own_start - recorded_start) <= _START_TIME_EPSILON_S
+
+
 def release() -> None:
-    """Remove the lockfile.  Safe to call when the lock is not held."""
+    """Remove the lockfile, but only if this process still holds it.
+
+    Safe to call when no lock is held.  The ownership check matters
+    because tenants overlap: a runner whose own turn is long over may
+    reach its ``finally`` while a *later* routine already holds the
+    lock.  Deleting that lockfile would let a third routine start
+    alongside the second — two indexing runs sharing one GPU, which is
+    how this lock gets its job wrong in the most expensive way.
+
+    The read-then-unlink is not atomic, so a lock handed over in the
+    microseconds between the two calls could still be removed.  That
+    window is bounded by two syscalls, against the minutes-to-hours of
+    overlap the unconditional delete allowed.
+    """
+    try:
+        info = LOCK_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+    if not _lock_is_ours(info):
+        logger.info("Not releasing routine lock, held by someone else: %s", info)
+        return
+
     try:
         LOCK_FILE.unlink(missing_ok=True)
     except OSError:

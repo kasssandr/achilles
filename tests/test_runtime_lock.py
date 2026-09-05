@@ -403,3 +403,90 @@ class TestBootTimeHelper:
         assert boot < now, "boot time must lie in the past"
         # A machine that booted more than 10 years ago is not plausible.
         assert now - boot < 10 * 365 * 24 * 3600
+
+
+# ── release() ownership ─────────────────────────────────────────────────
+
+
+class TestReleaseOnlyOwnLock:
+    """``release()`` must never remove a lock that belongs to someone else.
+
+    A runner that finishes while a *later* tenant already holds the lock
+    used to delete that tenant's lockfile, letting a third routine start
+    alongside it — two indexing runs on one GPU.  Every uncertain case
+    here keeps the lockfile: ``STALE_AFTER_S`` and the liveness checks in
+    :func:`acquire` remain the backstop for a genuinely abandoned lock.
+    """
+
+    def test_keeps_lock_held_by_another_pid(self, _isolated_lockfile: Path):
+        _isolated_lockfile.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_lockfile.write_text(
+            f"other-runner  PID={os.getpid() + 1}  "
+            f"since={datetime.now().isoformat()}  start=1.0",
+            encoding="utf-8",
+        )
+
+        runtime_lock.release()
+
+        assert _isolated_lockfile.exists()
+        assert "other-runner" in _isolated_lockfile.read_text(encoding="utf-8")
+
+    def test_keeps_lock_whose_start_time_is_not_ours(
+        self, _isolated_lockfile: Path,
+    ):
+        """Same PID, different creation time — a recycled PID, not us."""
+        _isolated_lockfile.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_lockfile.write_text(
+            f"recycled  PID={os.getpid()}  "
+            f"since={datetime.now().isoformat()}  start=1.0",
+            encoding="utf-8",
+        )
+
+        runtime_lock.release()
+
+        assert _isolated_lockfile.exists()
+
+    def test_keeps_lock_without_pid_field(self, _isolated_lockfile: Path):
+        """An unparseable holder is not provably us, so it stays."""
+        _isolated_lockfile.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_lockfile.write_text("legacy-holder", encoding="utf-8")
+
+        runtime_lock.release()
+
+        assert _isolated_lockfile.exists()
+
+    def test_releases_legacy_lock_with_our_pid_and_no_start(
+        self, _isolated_lockfile: Path,
+    ):
+        """A lockfile predating the ``start`` field still releases on PID."""
+        _isolated_lockfile.parent.mkdir(parents=True, exist_ok=True)
+        _isolated_lockfile.write_text(
+            f"legacy  PID={os.getpid()}  since={datetime.now().isoformat()}",
+            encoding="utf-8",
+        )
+
+        runtime_lock.release()
+
+        assert not _isolated_lockfile.exists()
+
+    def test_still_releases_our_own_lock(self, _isolated_lockfile: Path):
+        """The regression guard: the normal path must keep working."""
+        assert runtime_lock.acquire("mine") is True
+        runtime_lock.release()
+        assert not _isolated_lockfile.exists()
+
+    def test_context_manager_keeps_a_stolen_lock(
+        self, _isolated_lockfile: Path,
+    ):
+        """The high-level API inherits the ownership guard."""
+        with runtime_lock.routine_lock("mine") as got_it:
+            assert got_it
+            # A later tenant reclaims the slot while we are still running.
+            _isolated_lockfile.write_text(
+                f"later-tenant  PID={os.getpid() + 1}  "
+                f"since={datetime.now().isoformat()}  start=1.0",
+                encoding="utf-8",
+            )
+
+        assert _isolated_lockfile.exists()
+        assert "later-tenant" in _isolated_lockfile.read_text(encoding="utf-8")

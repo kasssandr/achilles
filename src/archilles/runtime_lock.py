@@ -8,6 +8,10 @@ future tenants like the news agent.
 
 Design
 ------
+* **Mutual exclusion:** the lockfile is created with ``O_CREAT |
+  O_EXCL``, so the create-or-fail decision is made by the kernel.  Two
+  acquirers starting in the same millisecond — as the OnLogon scheduled
+  tasks do — cannot both come away believing they hold the lock.
 * **Lockfile content:** a short human-readable line ``"{script_name}  PID=…
   since=ISO  start=EPOCH"``.  Reading it shows you which automation
   currently holds the lock and since when; ``start`` is the holder
@@ -112,6 +116,11 @@ _CLOCK_MARGIN_S: int = 120
 #: before we call them different processes.  The kernel reports a stable
 #: value, so this only absorbs the rounding of writing it to the lockfile.
 _START_TIME_EPSILON_S: float = 1.0
+
+#: How often :func:`acquire` may clear a dead holder's lockfile before
+#: giving up and waiting instead.  Bounds the retry loop: a lockfile we
+#: judge dead but cannot remove must not spin the CPU.
+_MAX_RECLAIM_ATTEMPTS: int = 3
 
 _PID_RE = re.compile(r"PID=(\d+)")
 _SINCE_RE = re.compile(r"since=(\S+)")
@@ -273,6 +282,42 @@ def _holder_is_gone(info: str, mtime: float) -> bool:
 # ── Low-level API ───────────────────────────────────────────────────────
 
 
+def _create_lockfile(script_name: str) -> bool:
+    """Create the lockfile for this process, or report that it exists.
+
+    ``O_CREAT | O_EXCL`` puts the whole decision in one syscall, which is
+    what makes this a mutex at all: a check followed by a separate write
+    lets two acquirers racing within the same millisecond both find the
+    slot empty and both fill it.
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, _lock_line(script_name).encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _discard_lockfile(expected: str) -> None:
+    """Remove a lockfile whose holder we judged gone.
+
+    Re-reads the content first and unlinks only what still matches: by
+    the time we get here another acquirer may have cleared the same dead
+    lock and written its own, and deleting *that* would put us back to
+    two holders — the very failure this module exists to prevent.
+    """
+    try:
+        if LOCK_FILE.read_text(encoding="utf-8").strip() != expected:
+            return
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def acquire(script_name: str, wait_s: int = 0) -> bool:
     """Try to acquire the global routine lock.
 
@@ -302,34 +347,45 @@ def acquire(script_name: str, wait_s: int = 0) -> bool:
     """
     deadline = time.time() + wait_s
     info = ""
+    reclaims = 0
     while True:
-        busy = False
-        if LOCK_FILE.exists():
-            try:
-                mtime = LOCK_FILE.stat().st_mtime
-                content = LOCK_FILE.read_text(encoding="utf-8").strip()
-            except OSError:
-                # Vanished between exists() and the read — treat as free.
-                pass
-            else:
-                if time.time() - mtime < STALE_AFTER_S:
-                    if _holder_is_gone(content, mtime):
-                        logger.warning(
-                            "Reclaiming routine lock — holder is gone: %s",
-                            content,
-                        )
-                        print(
-                            f"  Reclaiming stale lock (holder gone): {content}",
-                            file=sys.stderr,
-                        )
-                    else:
-                        busy = True
-                        info = content
-
-        if not busy:
-            LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-            LOCK_FILE.write_text(_lock_line(script_name), encoding="utf-8")
+        if _create_lockfile(script_name):
             return True
+
+        # The slot is taken.  Read the holder and decide whether it counts.
+        try:
+            mtime = LOCK_FILE.stat().st_mtime
+            content = LOCK_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            # Vanished under us — the slot is free again, try to take it.
+            # Bounded, because a lockfile that stays unreadable for some
+            # other reason must not spin us at full CPU.
+            if reclaims < _MAX_RECLAIM_ATTEMPTS:
+                reclaims += 1
+                continue
+            mtime, content = time.time(), "(unreadable lockfile)"
+
+        dead = False
+        if time.time() - mtime >= STALE_AFTER_S:
+            dead = True  # heartbeat stopped long ago
+        elif _holder_is_gone(content, mtime):
+            dead = True
+            logger.warning(
+                "Reclaiming routine lock — holder is gone: %s", content
+            )
+            print(
+                f"  Reclaiming stale lock (holder gone): {content}",
+                file=sys.stderr,
+            )
+
+        if dead and reclaims < _MAX_RECLAIM_ATTEMPTS:
+            reclaims += 1
+            _discard_lockfile(content)
+            continue
+
+        # Either a live holder, or a dead one we could not clear.  Both
+        # mean the same thing for us: wait.
+        info = content
 
         if time.time() >= deadline:
             logger.warning(
@@ -347,6 +403,10 @@ def acquire(script_name: str, wait_s: int = 0) -> bool:
             f"  Waiting for lock ({remaining}s left): {info}", file=sys.stderr
         )
         time.sleep(_POLL_INTERVAL_S)
+        # Fresh budget per poll cycle: the cap only exists to stop a tight
+        # spin.  A holder that dies during a two-hour wait must still be
+        # reclaimable when we look again.
+        reclaims = 0
 
 
 def _lock_is_ours(info: str) -> bool:

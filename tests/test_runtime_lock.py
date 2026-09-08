@@ -490,3 +490,88 @@ class TestReleaseOnlyOwnLock:
 
         assert _isolated_lockfile.exists()
         assert "later-tenant" in _isolated_lockfile.read_text(encoding="utf-8")
+
+
+# ── Concurrent acquire ──────────────────────────────────────────────────
+
+
+class TestConcurrentAcquire:
+    """Two routines starting in the same instant must not both win.
+
+    This is the failure that let a Calibre and a Zotero watchdog index
+    side by side on one 4 GB GPU: both OnLogon tasks fired in the same
+    second, both found the slot empty, and both filled it.
+    """
+
+    def test_only_one_of_many_racers_acquires(
+        self, _isolated_lockfile: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # Widen the gap between deciding the slot is free and filling it.
+        # An atomic create has no such gap; a check-then-write has one,
+        # and this makes it big enough to hit reliably.
+        real_lock_line = runtime_lock._lock_line
+
+        def _slow_lock_line(script_name: str) -> str:
+            time.sleep(0.05)
+            return real_lock_line(script_name)
+
+        monkeypatch.setattr(runtime_lock, "_lock_line", _slow_lock_line)
+
+        racers = 6
+        start = threading.Barrier(racers)
+        results: list[bool] = []
+        guard = threading.Lock()
+
+        def _race(n: int) -> None:
+            start.wait()
+            got = runtime_lock.acquire(f"racer-{n}", wait_s=0)
+            with guard:
+                results.append(got)
+
+        threads = [
+            threading.Thread(target=_race, args=(n,)) for n in range(racers)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert sum(results) == 1, f"expected exactly one winner, got {results}"
+        # The lockfile must name the winner and nobody else.
+        content = _isolated_lockfile.read_text(encoding="utf-8")
+        assert content.count("racer-") == 1, content
+
+    def test_second_acquire_leaves_the_first_lockfile_untouched(
+        self, _isolated_lockfile: Path,
+    ):
+        """A loser must not overwrite the winner's line."""
+        assert runtime_lock.acquire("winner") is True
+        before = _isolated_lockfile.read_text(encoding="utf-8")
+
+        assert runtime_lock.acquire("loser", wait_s=0) is False
+
+        assert _isolated_lockfile.read_text(encoding="utf-8") == before
+
+
+class TestDiscardLockfile:
+    def test_removes_the_lockfile_it_was_shown(self, _isolated_lockfile: Path):
+        _isolated_lockfile.write_text("dead-holder", encoding="utf-8")
+        runtime_lock._discard_lockfile("dead-holder")
+        assert not _isolated_lockfile.exists()
+
+    def test_keeps_a_lockfile_that_changed_meanwhile(
+        self, _isolated_lockfile: Path,
+    ):
+        """Another acquirer may have cleared the dead lock and taken the
+        slot between our judgement and our unlink — that fresh lock must
+        survive, or we are back to two holders."""
+        _isolated_lockfile.write_text("fresh-holder", encoding="utf-8")
+        runtime_lock._discard_lockfile("dead-holder")
+        assert _isolated_lockfile.exists()
+        assert (
+            _isolated_lockfile.read_text(encoding="utf-8") == "fresh-holder"
+        )
+
+    def test_no_lockfile_is_a_no_op(self, _isolated_lockfile: Path):
+        runtime_lock._discard_lockfile("anything")
+        assert not _isolated_lockfile.exists()

@@ -506,6 +506,12 @@ Examples:
                 for ft, n in sorted(stats['file_types'].items(), key=lambda x: -x[1]):
                     print(f"    {ft:<25} {n:>8}")
                 print()
+            versions = {v: n for v, n in stats.get('producer_versions', {}).items() if v}
+            if versions:
+                print(f"  Scriptor spec versions:")
+                for v, n in sorted(versions.items()):
+                    print(f"    {v:<25} {n:>8}")
+                print()
 
         elif args.command == 'prepare':
             # Prepare book (extract + chunk, no embedding)

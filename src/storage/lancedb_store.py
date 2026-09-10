@@ -97,6 +97,14 @@ class LanceDBStore:
         # the marker existed; see src/archilles/pipeline_version.py.
         "pipeline_version": str,
 
+        # Provenance of a row read from a Scriptor bundle: the producer's
+        # signal beside Archilles' reading of it -- region name next to
+        # section_type, the witness behind page_label, the prepared-format
+        # version of the master. '' for every other row.
+        "region": str,
+        "label_source": str,
+        "producer_version": str,
+
         # Hardware-Tiers-V2 §12: 1 = provisionally light (mode=full-external,
         # waiting for an external hierarchical re-embed), 0 = final. Lets the
         # discovery path tell "provisional light" from "deliberately light".
@@ -135,6 +143,9 @@ class LanceDBStore:
         # Rows written before the marker existed keep '' — that is the signal,
         # not a gap: '' plus indexed_at locates the pre-marker generations.
         "pipeline_version": "''",
+        "region": "''",
+        "label_source": "''",
+        "producer_version": "''",
     }
 
     def _ensure_table(self):
@@ -370,6 +381,11 @@ class LanceDBStore:
                 # Not taken from the chunk dict: a caller that could pass its
                 # own value could claim a generation it did not produce.
                 "pipeline_version": PIPELINE_VERSION,
+
+                # Scriptor provenance, from the extractor that read the master
+                "region": chunk.get("region") or "",
+                "label_source": chunk.get("label_source") or "",
+                "producer_version": chunk.get("producer_version") or "",
             }
 
             records.append(record)
@@ -473,6 +489,11 @@ class LanceDBStore:
 
                     # Parent-Child hierarchy
                     "parent_id": meta.get("parent_id", ""),
+
+                    # Scriptor provenance (no parser sets it; kept for symmetry)
+                    "region": meta.get("region", ""),
+                    "label_source": meta.get("label_source", ""),
+                    "producer_version": meta.get("producer_version", ""),
 
                     # Technical metadata
                     "source_file": doc.file_path,
@@ -788,7 +809,9 @@ class LanceDBStore:
         ``pipeline_version`` is refused for the same reason in a different
         direction: it is a claim about who wrote a row, and a marker that any
         caller may overwrite is a docstring again (finding 1.7a). It is set by
-        ``add_chunks`` and by nothing else.
+        ``add_chunks`` and by nothing else. ``producer_version`` is refused
+        alike: the prepared-format version of the master a row was read from,
+        known only to the write that read it.
 
         ``text`` and ``vector`` are refused (finding 1.7b). Both are columns in
         the schema, so the filter below would have written them like any other
@@ -806,8 +829,8 @@ class LanceDBStore:
             Number of chunks updated (approximate)
 
         Raises:
-            ValueError: if ``updates`` contains ``text``, ``vector`` or
-                ``pipeline_version``.
+            ValueError: if ``updates`` contains ``text``, ``vector``,
+                ``pipeline_version`` or ``producer_version``.
         """
         forbidden = {'text', 'vector'} & set(updates)
         if forbidden:
@@ -822,6 +845,12 @@ class LanceDBStore:
                 "update_metadata_fields refuses 'pipeline_version': it records "
                 "which generation of the pipeline composed a row, and a run "
                 "that did not compose it cannot say. add_chunks sets it."
+            )
+        if 'producer_version' in updates:
+            raise ValueError(
+                "update_metadata_fields refuses 'producer_version': it records "
+                "which prepared-format version the row was read from, and only "
+                "the write that read the master can say. Re-index the book."
             )
 
         if self.table is None:
@@ -1358,7 +1387,8 @@ class LanceDBStore:
 
         # Project only the columns the stats need — avoids decoding text/vector/
         # window_text for every chunk on each page load.
-        columns = ["book_id", "chunk_type", "format", "section_type", "language"]
+        columns = ["book_id", "chunk_type", "format", "section_type", "language",
+                   "producer_version"]
         try:
             lance_dataset = self.table.to_lance()
             existing = set(lance_dataset.schema.names)
@@ -1376,6 +1406,9 @@ class LanceDBStore:
             "file_types": df["format"].value_counts().to_dict() if "format" in df else {},
             "section_types": df["section_type"].value_counts().to_dict() if "section_type" in df else {},
             "languages": df["language"].value_counts().to_dict() if "language" in df else {},
+            # The Scriptor population and its spec versions; '' = everything else.
+            "producer_versions": (df["producer_version"].value_counts().to_dict()
+                                  if "producer_version" in df else {}),
         }
 
     def close(self):

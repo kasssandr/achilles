@@ -175,6 +175,8 @@ class ArchillesRAG:
         ('chapter', 'chapter'), ('section', 'section'),
         ('section_title', 'section_title'), ('section_type', 'section_type'),
         ('language', 'language'),
+        ('region', 'region'), ('label_source', 'label_source'),
+        ('producer_version', 'producer_version'),
     ]
 
     def __init__(

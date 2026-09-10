@@ -25,7 +25,6 @@ Called from:
 
 import json
 import logging
-import os
 import sqlite3
 import time
 from datetime import datetime
@@ -34,8 +33,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Book formats in order of preference — canonical list in constants.py
-from src.archilles.constants import PREFERRED_FORMATS as _PREFERRED_FORMATS  # noqa: E402
+# The book files of a Calibre folder, in preference order -- shared with batch_index.
+from src.archilles.book_files import discover_formats  # noqa: E402
 
 # Tags that exclude a book from indexing. The canonical list lives in
 # ``src.archilles.config`` so every consumer (watchdog, batch_index, MCP
@@ -48,33 +47,6 @@ from src.archilles.orphan_guard import (  # noqa: E402
     check_orphan_bound,
 )
 from src.archilles.sqlite_ro import connect_readonly  # noqa: E402
-
-
-_PREFERRED_FORMAT_SET = frozenset(_PREFERRED_FORMATS)
-
-
-def _discover_formats(book_path: Path) -> list[dict[str, str]]:
-    """Find supported book files in *book_path*, in PREFERRED_FORMATS order.
-
-    One directory scan instead of one glob per extension — this runs for
-    every library book on every watchdog scan.
-    """
-    by_ext: dict[str, list[str]] = {}
-    try:
-        with os.scandir(book_path) as it:
-            for entry in it:
-                if not entry.is_file():
-                    continue
-                suffix = os.path.splitext(entry.name)[1].lower()
-                if suffix in _PREFERRED_FORMAT_SET:
-                    by_ext.setdefault(suffix, []).append(entry.path)
-    except OSError:
-        return []
-    return [
-        {'format': ext[1:].upper(), 'path': path}
-        for ext in _PREFERRED_FORMATS
-        for path in sorted(by_ext.get(ext, ()))
-    ]
 
 
 def _clean_html(html_text: str) -> str:
@@ -715,7 +687,7 @@ class WatchdogScanner:
                 continue
 
             book_path = Path(meta['path'])
-            formats = _discover_formats(book_path)
+            formats = discover_formats(book_path)
             formats_by_cid[cid] = formats
             if not formats:
                 continue  # no supported file on disk
@@ -810,7 +782,7 @@ class WatchdogScanner:
                 if not meta:
                     continue
                 formats = (formats_by_cid[cid] if cid in formats_by_cid
-                           else _discover_formats(Path(meta['path'])))
+                           else discover_formats(Path(meta['path'])))
                 if not formats:
                     continue
                 file_path = formats[0]['path']
@@ -878,7 +850,7 @@ class WatchdogScanner:
                     if not meta:
                         continue
                     formats = (formats_by_cid[cid] if cid in formats_by_cid
-                               else _discover_formats(Path(meta['path'])))
+                               else discover_formats(Path(meta['path'])))
                     if not formats:
                         continue
                     print(f"\n[{already_done + j}/{total_p3}] {meta.get('author', '')}: {entry['title']}")
@@ -964,7 +936,7 @@ class WatchdogScanner:
                 if not meta:
                     continue
                 formats = (formats_by_cid[cid] if cid in formats_by_cid
-                           else _discover_formats(Path(meta['path'])))
+                           else discover_formats(Path(meta['path'])))
                 if not formats:
                     continue
                 print(f"\n[{already_done + j}/{total_p4}] {meta.get('author', '')}: {entry['title']}")

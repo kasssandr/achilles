@@ -34,7 +34,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.watchdog import _resolve_paths                  # noqa: E402
 from src.archilles.constants import ChunkType                # noqa: E402
-from src.archilles.watchdog import WatchdogScanner, _discover_formats  # noqa: E402
+from src.archilles.watchdog import WatchdogScanner           # noqa: E402
+from src.archilles.book_files import discover_formats        # noqa: E402
 from src.archilles.config import get_excluded_tags           # noqa: E402
 from src.archilles.sqlite_ro import connect_readonly         # noqa: E402
 from src.archilles.runtime_lock import routine_lock          # noqa: E402
@@ -170,7 +171,7 @@ def _run(args, library_path, db_path, archilles_dir, excluded,
         if not rel:
             skipped += 1
             continue
-        formats = _discover_formats(Path(library_path) / rel)
+        formats = discover_formats(Path(library_path) / rel)
         if not formats:
             skipped += 1
             continue

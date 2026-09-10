@@ -1,7 +1,6 @@
 """Indexing component: book indexing (3 paths), phase-1 metadata stubs,
 prepare/embed two-phase pipeline, smart updates, metadata extraction and
 hashing. Extracted from the ArchillesRAG monolith (8.16)."""
-import hashlib
 import json
 import os
 import re
@@ -14,41 +13,17 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from tqdm import tqdm
 
+from src.archilles.book_files import bundle_master, prepared_jsonl_name  # noqa: F401 -- re-exported
 from src.archilles.comment_chunks import build_comment_chunks
 from src.archilles.constants import ChunkType
 from src.archilles.indexer import IndexingCheckpoint
 from src.calibre_db import CalibreDB
 from src.calibre_mcp.annotations import get_combined_annotations
 
-# Characters that are invalid in Windows filenames (superset of POSIX).
-_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
 # PDFs shorter than this never trigger the needs-OCR warning. Reference
 # managers routinely attach tiny scanned PDFs (Zotero stores publisher TOC /
 # preview scans); flagging each one buries the real OCR candidates in noise.
 OCR_WARN_MIN_PAGES = 6
-
-
-def prepared_jsonl_name(book_id: str) -> str:
-    """Filename for a book's prepared-chunks JSONL (one file per book).
-
-    Keyed by the adapter-unique ``book_id``, not ``calibre_id`` — non-Calibre
-    sources (Zotero keys, folder ids) have no Calibre id, so every item used
-    to collide on ``0.jsonl`` and only one book per library ever got prepared
-    (review 2026-07-03, finding 5.1). For Calibre books ``book_id`` is the
-    numeric id as a string, so existing ``{calibre_id}.jsonl`` corpora keep
-    matching.
-
-    Filesystem-unsafe characters are replaced; whenever sanitisation changes
-    the name (or empties it), a short hash of the original id is appended so
-    distinct ids ("a/b" vs "a_b") cannot map to the same file.
-    """
-    original = str(book_id)
-    safe = _UNSAFE_FILENAME_CHARS.sub('_', original).strip(' .')
-    if not safe or safe != original:
-        digest = hashlib.md5(original.encode('utf-8')).hexdigest()[:8]
-        safe = f"{safe or 'book'}-{digest}"
-    return f"{safe}.jsonl"
 
 
 def read_prepared_header(path: Path) -> Optional[dict]:
@@ -964,6 +939,22 @@ class Indexer:
             print(f"    Replaced {deleted} existing chunk(s)")
         return deleted
 
+    def _text_source(self, book_path: Path, book_id: str) -> Path:
+        """Where the book's text is read from: its Scriptor bundle, if the
+        library holds one for ``book_id``, else the book file itself.
+
+        Only the text moves. The book file stays the book's identity --
+        metadata, viewer annotations (keyed by the file's path) and links are
+        still looked up with it (Naht S4).
+        """
+        library = (Path(self._rag._adapter.library_path) if self._rag._adapter is not None
+                   else CalibreDB.find_library_path(book_path))
+        master = bundle_master(library / '.archilles', book_id) if library else None
+        if master is None:
+            return book_path
+        print(f"  Text:  Scriptor bundle {master.parent.name}/{master.name}")
+        return master
+
     def index_book(self, book_path: str, book_id: str = None, force: bool = False, phase: str = 'phase2') -> Dict[str, Any]:
         """
         Extract and index a book.
@@ -1048,7 +1039,7 @@ class Indexer:
         # PHASE 2: Full content indexing (default)
         # Step 1: Extract text
         start_time = time.time()
-        extracted = self._rag.extractor.extract(book_path)
+        extracted = self._rag.extractor.extract(self._text_source(book_path, book_id))
         extract_time = time.time() - start_time
 
         # Detect scanned/mostly-scanned PDFs
@@ -1185,7 +1176,8 @@ class Indexer:
         with its own chunk_size — `BaseExtractor._temporary_chunk_params`
         only handles a single instance, so we iterate them all here.
         """
-        sub_attrs = ("pdf_extractor", "epub_extractor", "txt_extractor", "html_extractor")
+        sub_attrs = ("pdf_extractor", "epub_extractor", "txt_extractor", "html_extractor",
+                     "scriptor_extractor")
         saved = []
         for attr in sub_attrs:
             sub = getattr(self._rag.extractor, attr, None)
@@ -1253,7 +1245,7 @@ class Indexer:
         with self._override_extractor_chunking(
             self._rag._prepare_chunk_size, self._rag._prepare_overlap
         ):
-            extracted = self._rag.extractor.extract(book_path)
+            extracted = self._rag.extractor.extract(self._text_source(book_path, book_id))
         extract_time = time.time() - start_time
 
         # Handle hierarchical chunking if requested

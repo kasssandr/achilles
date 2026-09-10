@@ -71,7 +71,8 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.archilles.engine import ArchillesRAG, LanceDBError
-from src.archilles.engine.indexing import prepared_jsonl_name, read_prepared_header
+from src.archilles.engine.indexing import read_prepared_header
+from src.archilles.book_files import bundle_master, discover_formats, prepared_jsonl_name
 from scripts.safe_indexer import SafeIndexer
 from scripts.find_books_missing_labels import find_books_missing_labels
 
@@ -169,16 +170,11 @@ def resolve_indexing_plan(
 
 
 
-def _discover_formats(book_path: Path) -> List[Dict[str, str]]:
-    """Find available book formats in a Calibre book directory."""
-    formats = []
-    for ext in PREFERRED_FORMATS:
-        for file in book_path.glob(f'*{ext}'):
-            formats.append({
-                'format': ext[1:].upper(),
-                'path': str(file)
-            })
-    return formats
+def _format_label(book: Dict[str, Any], best: Dict[str, str]) -> str:
+    """The format a book's text comes from. Where the library holds a Scriptor
+    bundle for it, that is SCRIPTOR: index_book reads the bundle, although the
+    book file is what it is handed (see Indexer._text_source)."""
+    return 'SCRIPTOR' if book.get('bundle') else best['format']
 
 
 def _select_best_format(formats: List[Dict[str, str]], prefer_format: str = 'PDF') -> Dict[str, str]:
@@ -366,11 +362,12 @@ def _build_book_entry(row: sqlite3.Row, library_path: Path, include_rating: bool
     Returns None if the book has no supported formats on disk.
     """
     book_path = library_path / row['path']
-    formats = _discover_formats(book_path)
+    formats = discover_formats(book_path)
 
     if not formats:
         return None
 
+    bundle = bundle_master(library_path / '.archilles', str(row['id']))
     entry = {
         'id': row['id'],
         'title': row['title'],
@@ -378,6 +375,7 @@ def _build_book_entry(row: sqlite3.Row, library_path: Path, include_rating: bool
         'path': str(book_path),
         'formats': formats,
         'best_format': _select_best_format(formats),
+        'bundle': str(bundle) if bundle else None,
     }
 
     if include_rating:
@@ -1286,8 +1284,11 @@ def batch_prepare(
                 # Invalid header or a chunk-count mismatch (interrupted
                 # prepare) — fall through and re-prepare.
 
-        # Quality-based format selection for multi-format books
-        has_multiple = quality_select and len(book['formats']) > 1
+        # Quality-based format selection for multi-format books. Not for a
+        # book with a bundle: every candidate would be read from the bundle,
+        # which passed its checks when it was made.
+        has_multiple = (quality_select and len(book['formats']) > 1
+                        and not book.get('bundle'))
         if has_multiple and not dry_run:
             best, scores = _select_best_format_by_quality(
                 book['formats'], rag, book_id, prefer_format
@@ -1304,7 +1305,7 @@ def batch_prepare(
                 print(f"         Format: {best['format']} | ID: {book_id}")
         else:
             best = _select_best_format(book['formats'], prefer_format)
-            print(f"         Format: {best['format']} | ID: {book_id}")
+            print(f"         Format: {_format_label(book, best)} | ID: {book_id}")
 
         if dry_run:
             print(f"         Would prepare: {best['path']}")
@@ -1425,8 +1426,10 @@ def batch_index(
 
         book_id = create_book_id(book)
 
-        # Format selection: quality-based or static preference
-        has_multiple = quality_select and len(book['formats']) > 1
+        # Format selection: quality-based or static preference (a book with a
+        # bundle is not compared -- see batch_prepare)
+        has_multiple = (quality_select and len(book['formats']) > 1
+                        and not book.get('bundle'))
         if has_multiple:
             best, scores = _select_best_format_by_quality(
                 book['formats'], rag, book_id, prefer_format
@@ -1445,7 +1448,7 @@ def batch_index(
         else:
             best = _select_best_format(book['formats'], prefer_format)
             print(f"\n[{i}/{len(books)}] {book['author']}: {book['title']}")
-            print(f"         Format: {best['format']} | ID: {book_id}")
+            print(f"         Format: {_format_label(book, best)} | ID: {book_id}")
 
         ordered_formats = [best] + [f for f in book['formats'] if f['path'] != best['path']]
 

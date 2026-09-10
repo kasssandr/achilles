@@ -25,8 +25,9 @@ from pathlib import Path
 
 from scriptor.document import Bundle, ParsedDoc, load_bundle, parse_prepared, region_at
 from scriptor.reflow.pagelabel import PAGE_MARKER_RE
-from scriptor.reflow.regions import APPARATUS, read_metadata_block
+from scriptor.reflow.regions import APPARATUS
 
+from src.archilles.book_files import is_scriptor_master
 from src.archilles.constants import SectionType
 from .base import BaseExtractor
 from .exceptions import ExtractionError
@@ -38,10 +39,6 @@ from .models import ChunkMetadata, ExtractedText
 # unknown label source passed through, unknown field ignored); a new major is
 # refused, never indexed on a guess (spec §11).
 SUPPORTED_SPEC_MAJOR = 0
-
-_MASTER_SUFFIXES = frozenset({'.md', '.markdown'})
-# Enough for the metadata block, which opens the master (spec §4.1).
-_SNIFF_BYTES = 4096
 
 _FRONT_MATTER_REGIONS = frozenset({'front-matter', 'contents'})
 
@@ -134,21 +131,8 @@ class ScriptorExtractor(BaseExtractor):
     """Read a Scriptor master, and the pagination sidecar beside it, into chunks."""
 
     def supports(self, file_path: Path) -> bool:
-        """A Markdown file whose metadata block names a ``format_version``.
-
-        The detected format cannot tell: python-magic calls a master text/plain,
-        like any note. The block can, and it opens the file (spec §4.1).
-        """
-        file_path = Path(file_path)
-        if file_path.suffix.lower() not in _MASTER_SUFFIXES:
-            return False
-        try:
-            with open(file_path, 'rb') as f:
-                head = f.read(_SNIFF_BYTES)
-        except OSError:
-            return False
-        block = read_metadata_block(head.decode('utf-8', errors='replace').replace('\r\n', '\n'))
-        return bool(block and block.get('format_version'))
+        """A Scriptor master: Markdown whose metadata block names a format_version."""
+        return is_scriptor_master(file_path)
 
     def extract(self, file_path: Path) -> ExtractedText:
         file_path = Path(file_path)

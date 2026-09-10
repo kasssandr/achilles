@@ -33,6 +33,13 @@ class ChunkMetadata:
     source_file: Optional[str] = None
     format: Optional[str] = None
 
+    # Provenance, set by ScriptorExtractor only: the producer's signal beside
+    # Archilles' reading of it -- the region name next to section_type, the
+    # witness behind page_label, and the spec version the master follows.
+    region: Optional[str] = None
+    label_source: Optional[str] = None
+    producer_version: Optional[str] = None
+
     # Calibre integration
     calibre_uri: Optional[str] = None
 

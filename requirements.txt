@@ -5,7 +5,7 @@
 
 # Text extraction
 pdfplumber==0.11.0  # PDF extraction (layout-aware)
-pymupdf==1.23.26  # PyMuPDF (fallback for PDF)
+pymupdf>=1.24  # PyMuPDF (fallback for PDF); archilles-scriptor needs >=1.24
 ebooklib==0.18  # EPUB extraction
 beautifulsoup4==4.12.2  # HTML/XML parsing
 lxml==5.1.0  # XML parser for BeautifulSoup
@@ -15,6 +15,11 @@ lxml==5.1.0  # XML parser for BeautifulSoup
 #   pip uninstall python-magic
 #   pip install python-magic-bin==0.4.14
 python-magic==0.4.27  # Magic byte detection (Linux/macOS)
+
+# Scriptor bundles (prepared Markdown + pagination sidecar): the format's reader
+# is imported, not copied. A hard dependency by design -- no fallback without it.
+# Pin to archilles-scriptor>=0.1,<1 once it is published on PyPI.
+archilles-scriptor @ git+https://github.com/kasssandr/archilles-scriptor.git
 
 # Encoding detection
 chardet==5.2.0  # Character encoding detection

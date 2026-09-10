@@ -21,6 +21,7 @@ from .pdf_extractor import PDFExtractor
 from .epub_extractor import EPUBExtractor
 from .txt_extractor import TXTExtractor
 from .html_extractor import HTMLExtractor
+from .scriptor_extractor import ScriptorExtractor
 from .calibre_converter import CalibreConverter
 from .ocr_extractor import OCRBackend
 
@@ -36,6 +37,8 @@ class UniversalExtractor:
     - PDF → PDFExtractor (pdfplumber/PyMuPDF)
     - EPUB → EPUBExtractor (ebooklib)
     - TXT → TXTExtractor (native)
+    - Scriptor master (.md whose metadata block names a format_version)
+      → ScriptorExtractor; any other Markdown → TXTExtractor
     - HTML → HTMLExtractor (BeautifulSoup)
     - MOBI/DJVU/DOC/etc. → Calibre → EPUB/PDF → Extract
 
@@ -89,6 +92,10 @@ class UniversalExtractor:
             chunk_size=chunk_size,
             overlap=overlap
         )
+        self.scriptor_extractor = ScriptorExtractor(
+            chunk_size=chunk_size,
+            overlap=overlap
+        )
 
         # Initialize Calibre converter (None when not installed)
         try:
@@ -121,9 +128,14 @@ class UniversalExtractor:
             f"format={detected_format} (via {detection_method})"
         )
 
-        # Try native extractors first
+        # Try native extractors first. A Scriptor master is Markdown that
+        # python-magic reports as text/plain, so its metadata block decides,
+        # not the detected format.
         native_error = None
-        extractor = self._get_native_extractor(detected_format)
+        if self.scriptor_extractor.supports(file_path):
+            extractor = self.scriptor_extractor
+        else:
+            extractor = self._get_native_extractor(detected_format)
         if extractor:
             try:
                 logger.info(f"Using native extractor: {extractor.__class__.__name__}")

@@ -38,7 +38,7 @@ from src.archilles.config import (
     master_archilles_dir,
     resolve_source_config,
 )
-from src.calibre_mcp.server import CalibreMCPServer, create_mcp_tools
+from src.calibre_mcp.server import CalibreMCPServer, citation_page, create_mcp_tools
 
 logger = logging.getLogger(__name__)
 
@@ -442,7 +442,7 @@ class UnifiedMCPServer:
                         "author": r.get("metadata", {}).get("author"),
                         "title": r.get("metadata", {}).get("book_title"),
                         "year": r.get("metadata", {}).get("year"),
-                        "page": r.get("metadata", {}).get("page"),
+                        **citation_page(r.get("metadata", {})),
                     },
                 }
                 for r in merged

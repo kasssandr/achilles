@@ -140,9 +140,10 @@ class PromptBuilder:
                 # Optional: add #page=N if we have a page number
                 calibre_url = f"calibre://view/{calibre_id}"
 
-                # Add page anchor if we have page info
-                if metadata.get('page'):
-                    calibre_url += f"#page={metadata['page']}"
+                # Add page anchor if we have page info (the physical page:
+                # the viewer counts pages, not printed labels)
+                if metadata.get('page_number'):
+                    calibre_url += f"#page={metadata['page_number']}"
 
                 link_parts.append(f"[📚 {t('export.open_in_calibre', lang)}]({calibre_url})")
 

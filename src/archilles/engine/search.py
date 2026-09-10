@@ -499,7 +499,7 @@ class Searcher:
             # Debug mode: show raw metadata values
             if os.environ.get('DEBUG_METADATA'):
                 print(f"    [DEBUG] section: {repr(metadata.get('section'))}, section_title: {repr(metadata.get('section_title'))}")
-                print(f"    [DEBUG] page_label: {repr(metadata.get('page_label'))}, printed_page: {repr(metadata.get('printed_page'))}")
+                print(f"    [DEBUG] page_label: {repr(metadata.get('page_label'))}, label_source: {repr(metadata.get('label_source'))}")
 
             page_val, is_pdf, page_warning = self._rag._resolve_page_info(metadata)
             if page_val:

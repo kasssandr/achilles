@@ -34,6 +34,20 @@ from .annotations import (
 logger = logging.getLogger(__name__)
 
 
+def citation_page(metadata: dict[str, Any]) -> dict[str, Any]:
+    """The page fields a client gets for a search result: the label as printed
+    where there is one, else the physical page, and the witness behind a label
+    read from a Scriptor bundle (``printed``, ``computed``, ... -- spec §6.3).
+
+    A search row carries ``page_label`` and ``page_number``; the ``page`` key
+    read here before is on no row, so every client was told None.
+    """
+    return {
+        'page': metadata.get('page_label') or metadata.get('page_number') or None,
+        'label_source': metadata.get('label_source') or None,
+    }
+
+
 class CalibreMCPServer:
     """
     MCP Server for Calibre library integration.
@@ -779,7 +793,7 @@ class CalibreMCPServer:
                             'author': r['metadata'].get('author'),
                             'title': r['metadata'].get('book_title'),
                             'year': r['metadata'].get('year'),
-                            'page': r['metadata'].get('page'),
+                            **citation_page(r['metadata']),
                         }
                     }
                     for r in results

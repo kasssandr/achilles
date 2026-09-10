@@ -129,6 +129,10 @@ Teil den Ist-Stand nicht schöner beschreibt, als er ist:
   die `[p. NN]`-Semantik des Scriptor-Liefertexts: Scriptor und Wiki sind
   die beiden Enden derselben Zitierbarkeits-Pipeline und dürfen bei
   »was heißt Seite« nicht auseinanderdriften.
+- Bei Chunks aus einem Scriptor-Bündel reist die physische Seite nicht im
+  Text, sondern über den Sidecar: `<master>.pagination.json` `pages[].pos`
+  (keine eigene Markerform, Naht-Befund §3.2). Der `ScriptorExtractor` führt
+  sie als `page_number`; ohne Sidecar ist sie 0.
 - Chunk-IDs (`{book_id}_chunk_{i}`) sind index-basiert und können bei
   Reindex verschieben; Anker sind deshalb redundant angelegt (book_id +
   Seite/Sektion bleiben menschlich und maschinell auflösbar, auch wenn der
@@ -145,9 +149,12 @@ eines, das aus der Zahlenfolge erschlossen wurde, sehen im Liefertext identisch
 aus. Ein Konsument, der eine Zitatangabe gewichten will, kann den Unterschied
 aus dem Marker nicht zurückgewinnen.
 
-**Der Import ist noch nicht gebaut** (ROADMAP: „künftiger Scriptor-Import").
-Dieser Abschnitt hält den Kontrakt fest, damit er beim Bau nicht neu erfunden
-oder stillschweigend verworfen wird.
+**Der Import ist gebaut** (Naht Scriptor → Archilles, Schritte S2–S5,
+September 2026): Der `ScriptorExtractor` liest Master und Sidecar,
+`label_source`, `region` und `producer_version` stehen als Spalten im Index, und
+die Ausgabe warnt bei einem Label aus `computed` oder einem unbekannten Wert
+(„page label inferred, not printed"). Dieser Abschnitt bleibt der Kontrakt, an
+dem der Import zu messen ist.
 
 ### Drei Kanäle
 
@@ -155,7 +162,7 @@ oder stillschweigend verworfen wird.
 |---|---|
 | `[p. NN]` im Text | unverändert, §II.5 gilt weiter |
 | Frontmatter des Masters | eine Zeile `pagination: <Kante>, <N>% of pages attested` |
-| `<master>.pagination.json` | Segmenttabelle, je Position `(label, source, confidence)`, überstimmte Lesungen mit Klassifikation |
+| `<master>.pagination.json` | Segmenttabelle, je physischer Position `pos` `(label, source, confidence)`, überstimmte Lesungen mit Klassifikation |
 
 ### `label_source` — der stärkste Zeuge, der das Label bestätigt hat
 

@@ -139,6 +139,12 @@ class ArchillesRAG:
             return f"{label}: {metadata['chapter']}"
         return ''
 
+    # Witnesses of a page label that need no warning (PREPARED_FORMAT_SPEC §6.3):
+    # `printed` and `link` corroborate the label; `toc` and `catalogue` assert
+    # it, but from a source they name -- the contents, the PDF's own labels.
+    # `computed`, and any value not listed here, is inferred.
+    _CITABLE_LABEL_SOURCES = frozenset({'printed', 'link', 'toc', 'catalogue'})
+
     @staticmethod
     def _resolve_page_info(metadata: Dict[str, Any]):
         """
@@ -146,27 +152,21 @@ class ArchillesRAG:
         Returns (page_value_or_None, is_pdf_page: bool, warning_or_None).
 
         page_value is the raw page number/label (e.g. "213", "xiv").
-        is_pdf_page indicates whether this is a PDF page (vs. printed/label).
+        is_pdf_page indicates whether this is a physical page (vs. a printed label).
+        The warning says when a label from a Scriptor bundle was inferred rather
+        than witnessed on the page. Rows from other sources carry no label_source
+        and get none.
         """
         page_label = metadata.get('page_label')
-        printed_page = metadata.get('printed_page')
-        printed_conf = metadata.get('printed_page_confidence', 0.0)
-
         if page_label:
+            source = metadata.get('label_source') or ''
+            if source and source not in ArchillesRAG._CITABLE_LABEL_SOURCES:
+                return page_label, False, "page label inferred, not printed — verify against the volume"
             return page_label, False, None
-
-        if printed_page and printed_conf >= 0.8:
-            warning = None
-            if printed_conf < 0.9:
-                warning = f"Seitenzahl-Konfidenz: {printed_conf:.2f} - bitte verifizieren"
-            return printed_page, False, warning
 
         page = metadata.get('page') or metadata.get('page_number')
         if page:
-            warning = None
-            if printed_page:
-                warning = f"Gedruckte Seitenzahl unsicher (Konfidenz: {printed_conf:.2f})"
-            return page, True, warning
+            return page, True, None
 
         return None, False, None
 

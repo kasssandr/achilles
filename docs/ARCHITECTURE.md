@@ -1,6 +1,6 @@
 # ARCHILLES – Architecture
 
-**Last updated:** June 2026 (engine extraction to `src/archilles/engine`; code-review hardening)
+**Last updated:** September 2026 (Scriptor seam: `ScriptorExtractor`, bundle text source, provenance columns; the modular pipeline described as what it is since July — experimental)
 
 This document describes *how* ARCHILLES is built. For *why* these choices were made, see [DECISIONS.md](DECISIONS.md).
 
@@ -24,20 +24,20 @@ The system is built around three principles: privacy by architecture (not by pol
                           │   (read-only access) │
                           └──────────┬──────────┘
                                      │
-                     ┌───────────────▼───────────────┐
-                     │         Extractors Layer       │
-                     │  ┌────────┐ ┌────────┐ ┌────┐ │
-                     │  │  PDF   │ │  EPUB  │ │OCR │ │
-                     │  │PyMuPDF │ │ebooklib│ │(T) │ │
-                     │  └───┬────┘ └───┬────┘ └─┬──┘ │
-                     └──────┼──────────┼────────┼────┘
-                            │          │        │
-                     ┌──────▼──────────▼────────▼────┐
-                     │       Modular Pipeline         │
-                     │  Parser → Chunker → Embedder   │
-                     │  (Registry-based component     │
-                     │   selection per profile)        │
-                     └───────────────┬────────────────┘
+                   ┌─────────────────▼─────────────────┐
+                   │          Extractors Layer         │
+                   │  ┌────────┐ ┌────────┐ ┌────────┐ │
+                   │  │  PDF   │ │  EPUB  │ │Scriptor│ │
+                   │  │PyMuPDF │ │ebooklib│ │ bundle │ │
+                   │  │+OCR (T)│ │        │ │(master)│ │
+                   │  └───┬────┘ └───┬────┘ └───┬────┘ │
+                   └──────┼──────────┼──────────┼──────┘
+                          │          │          │
+                   ┌──────▼──────────▼──────────▼──────┐
+                   │   Indexer (src/archilles/engine)  │
+                   │ extractor chunks → BGE-M3 vectors │
+                   │  (ExecutionPlan: mode, hierarchy) │
+                   └─────────────────┬─────────────────┘
                                      │
                     ┌────────────────▼────────────────┐
                     │         Storage Layer            │
@@ -120,6 +120,7 @@ Each extractor is responsible for turning a book file into structured text with 
 | --- | --- | --- | --- |
 | `PDFExtractor` | `pdf_extractor.py` | PDF | Primary: PyMuPDF (fitz); fallback: pdfplumber; OCR path |
 | `EPUBExtractor` | `epub_extractor.py` | EPUB 2/3 | ebooklib with custom TOC parser |
+| `ScriptorExtractor` | `scriptor_extractor.py` | Scriptor master (`.md` whose metadata block names a `format_version`) | Reads a bundle from `archilles-scriptor`: printed page labels, regions, bound footnotes; see below |
 | `TXTExtractor` | `txt_extractor.py` | TXT | Plain text with encoding detection |
 | `HTMLExtractor` | `html_extractor.py` | HTML | HTML documents |
 | `OCRExtractor` | `ocr_extractor.py` | Scanned PDFs | Tesseract baseline; VLM upgrade path prepared |
@@ -129,7 +130,7 @@ Common infrastructure: `base.py` (base class), `models.py` (dataclasses), `excep
 
 #### PDF Extractor (`pdf_extractor.py`)
 
-Primary extractor for PDF files, built on PyMuPDF (fitz). PDF is the preferred format because it provides reliable page number mapping—essential for citable references.
+Primary extractor for PDF files, built on PyMuPDF (fitz). PDF is the preferred format because it provides reliable page number mapping—essential for citable references. Where a book has a Scriptor bundle, the bundle is read instead (see Scriptor Extractor below); for all other PDFs this extractor remains the path, frozen as the fallback rather than developed further (ADR-032).
 
 Key capabilities: CropBox filtering eliminates headers, footers, and running page numbers before the text reaches the chunker, which significantly improves embedding quality. Page label extraction maps printed page numbers (which may differ from internal PDF page indices) to chunks, enabling citations like "p. 47" that match what a reader sees in the physical or digital book. Footer detection with footnote disambiguation ensures that footnotes are preserved while page-bottom noise is removed.
 
@@ -143,19 +144,42 @@ The multi-tier fallback system activates pdfplumber when PyMuPDF's extraction qu
 
 Built on ebooklib with custom TOC parsing. EPUBs provide richer structural information than PDFs: the table of contents maps directly to chapter boundaries, and the internal HTML structure enables section-level metadata extraction.
 
-Section metadata classification automatically labels content as Front Matter (foreword, table of contents), Main Content (the actual text, including introductions), or Back Matter (bibliography, index, appendices). Classification uses only semantically meaningful titles (H1 text or TOC entry titles) — never raw EPUB filenames, which caused false positives (e.g., `index_split_001.html` matching "index"). Introduction/Einleitung is deliberately classified as main_content, not front_matter. This classification powers the `section_filter` parameter in search—by default set to `'main'`, which excludes bibliography and index noise from results.
+Section metadata classification automatically labels content as Front Matter (foreword, table of contents), Main Content (the actual text, including introductions), or Back Matter (bibliography, index, appendices). A readable title (H1 text or TOC entry title) decides. Only an item without one falls back to its filename (`notes.xhtml`, `copyright.html`), and only in books whose filenames distinguish anything: a book converted into `index_split_000.html` … `index_split_412.html` names the converter, not the section, and the signal is discarded for it. Introduction/Einleitung is deliberately classified as main_content, not front_matter. This classification powers the `section_filter` parameter in search—by default set to `'main'`, which excludes bibliography and index noise from results.
+
+#### Scriptor Extractor (`scriptor_extractor.py`)
+
+The seam to [archilles-scriptor](https://github.com/kasssandr/archilles-scriptor), which turns printed books in PDF form into a *prepared document* (`PREPARED_FORMAT_SPEC.md`): a Markdown master carrying printed page markers (`[p. 88]`), region markers (`[region: bibliography]`) and bound footnotes, plus sidecars. Background and the choices behind it: ADR-032.
+
+- **The bundle is a text source, not a format.** It lives in `<library>/.archilles/scriptor/<key>/` (`key` = the book ID, numeric IDs zero-padded to five digits). `Indexer._text_source` swaps only where the text comes from, in `index_book` and `prepare_book`. Every caller still passes the book file, which stays the book's identity: Calibre metadata, viewer annotations (keyed by the file's path), export links and `source_file` all refer to it. `src/archilles/book_files.py` finds the master: exactly one `*.md` that is not `*.review.md` and names a `format_version`; two candidates are refused, not chosen.
+- **Reading.** The grammar is Scriptor's, imported from `scriptor.document` (`archilles-scriptor` is a hard runtime dependency, one direction only). What is Archilles' own is the mapping onto the chunk schema:
+  - The region becomes `section_type`: front matter and contents → `front_matter`; apparatus (`bibliography`, `index`, `abbreviations`, `notes`, `appendix`) → `back_matter`; everything else, including `preface` and any unknown name → `main_content`. The region name itself goes to `region`.
+  - The pagination sidecar's `pages[].pos` gives `page_number`, its `source` gives `label_source`.
+  - `#` headings give `chapter`, deeper ones `section_title`.
+  - `format_version` goes to `producer_version`. A master whose spec major differs from `SUPPORTED_SPEC_MAJOR` is refused, never indexed on a guess.
+- **Composition.** Chunks follow the master's `chunking_strategy`: `scientific` appends each footnote definition to the paragraph carrying its anchor, `basic` leaves definitions out. Markers are removed from the chunk text after they have been read. A chunk never spans two regions or sections, and overlap is by whole sentences.
+- **Producing bundles.** Bundles are built by `scripts/scriptor_prepare.py`, never by the watchdog. It runs Scriptor in-process, judges each volume by four admission conditions (`src/archilles/scriptor_build.py`: text coverage, notes against the audit, attested page labels, text under an inherited page number), moves a bundle into place only after it passes, and indexes it. A rejected run lands in `scriptor/_rejected/<key>/` and leaves the existing bundle and index untouched. `scriptor/REPORT.md` and `state.json` show each volume's values and whether its master is prepared, hand-edited, or released to the index. The library's `scriptor` config block sets the chunking strategy (default `scientific`).
 
 #### OCR Extractor (`ocr_extractor.py`)
 
-Tesseract serves as the baseline for modern printed text. The interface is designed for drop-in replacement with VLM-based OCR systems (LightOnOCR-2, GOT-OCR 2.0) as they mature. The `ArchillesService` exposes `ocr_backend` configuration (auto/tesseract/lighton/olmocr) to select backends.
+Tesseract serves as the baseline for modern printed text. The interface is designed for drop-in replacement with VLM-based OCR systems (LightOnOCR-2, GOT-OCR 2.0) as they mature. The `ArchillesService` exposes `ocr_backend` configuration (auto/tesseract/lighton/olmocr) to select backends. This path is due to be replaced: scans are to go through Scriptor's OCR backend onto its page model (boxes, sizes, confidences), so they get printed page labels instead of physical numbers (see ROADMAP v1.2). The VLM placeholders go with that step.
 
-### 3\. Modular Pipeline (`src/archilles/`)
+### 3\. Indexing Engine (`src/archilles/engine/`) and the experimental Modular Pipeline
 
-The `src/archilles/` package implements the modular processing pipeline with formal Registry patterns. This is the core infrastructure for document processing, separate from the extractors which handle raw text extraction.
+#### What runs in production
 
-#### Architecture: Parser → Chunker → Embedder
+`ArchillesRAG` (`engine/core.py`) composes `Indexer`, `Searcher` and `PromptBuilder`.
+- `Indexer.index_book` reads the book's text through `UniversalExtractor`, from its Scriptor bundle where one exists (`_text_source`).
+- The format extractor chunks the text itself (`BaseExtractor`): paragraphs gathered up to `chunk_size`, oversized paragraphs split at sentence ends, `window_text` for Small-to-Big, language detection per chunk. Chunks are optionally grouped into parents and children (`--hierarchical`, or `mode` through the `ExecutionPlan`, ADR-028).
+- `_build_chunk_dicts` carries the chunk metadata into the row, BGE-M3 embeds it, and `LanceDBStore.add_chunks` writes it. Nothing is deleted before its replacement has been extracted and embedded.
+- `prepare_book` does the same without embedding and writes `prepared_chunks/*.jsonl`, which `embed_prepared` embeds locally or on a remote GPU (ADR-015).
 
-The pipeline is orchestrated by `ModularPipeline` (`pipeline.py`), which chains three stages:
+A new input format therefore belongs in `src/extractors/`, next to `UniversalExtractor`. That is where the Scriptor import was built (ADR-032).
+
+#### Modular Pipeline (experimental — not the production path)
+
+`pipeline.py`, `parsers/` and `chunkers/` implement an alternative Parser → Chunker → Embedder pipeline. Since 4 July 2026 it is marked experimental and runs only behind `--use-modular-pipeline`, which no routine sets. It is not integrated with the `ExecutionPlan`, hierarchical chunking and language detection; it loads a second embedder next to the one already loaded; and it skips `metadata_hash` and annotation chunks, so the watchdog cannot see its books change. Whether it is removed is an open decision (ADR-004, September addendum). `embedders/` and `registry.py` are not part of that question: both are in production (external embedding, annotation embedding, `AnnotationProviderRegistry`).
+
+For reference, `ModularPipeline` chains three stages:
 
 1.  **Parsers** (`parsers/`): Convert files into `ParsedDocument` objects with structural metadata. `PyMuPDFParser` and `EPUBParser` are registered in `ParserRegistry` — parser selection is a genuine dispatch by file format, so it goes through a formal registry.
     
@@ -168,11 +192,11 @@ The pipeline is orchestrated by `ModularPipeline` (`pipeline.py`), which chains 
 3.  **Embedders** (`embedders/`): Generate vector representations. `BGEEmbedder` supports bge-small (384 dim), bge-base (768 dim), and bge-m3 (1024 dim, multilingual). Embedder selection happens directly by hardware profile (`pipeline._create_embedder_from_profile`), **not** via a registry.
     
 
-**On registries:** ARCHILLES uses formal registries only where component selection is a real runtime dispatch. Two exist, both on the generic `BaseRegistry[T]` (`src/archilles/registry.py`): `ParserRegistry` (by file format) and `AnnotationProviderRegistry` (annotation sources). Chunkers and embedders are *not* registry-based — their openness comes from the `TextChunker`/`TextEmbedder` ABCs, where a new variant is a single class. The earlier `ChunkerRegistry`/`EmbedderRegistry` were removed in the June 2026 code-review hardening (P2-Etappe 5) as dead infrastructure that merely simulated extensibility. See DECISIONS.md (ADR-004).
+**On registries:** ARCHILLES uses formal registries only where component selection is a real runtime dispatch. Two exist, both on the generic `BaseRegistry[T]` (`src/archilles/registry.py`): `ParserRegistry` (by file format, on the experimental path) and `AnnotationProviderRegistry` (annotation sources, in production). Chunkers and embedders are *not* registry-based — their openness comes from the `TextChunker`/`TextEmbedder` ABCs, where a new variant is a single class. The earlier `ChunkerRegistry`/`EmbedderRegistry` were removed in the June 2026 code-review hardening (P2-Etappe 5) as dead infrastructure that merely simulated extensibility. See DECISIONS.md (ADR-004).
 
 #### Hardware Profiles (`profiles.py`)
 
-Three pre-defined profiles adapt indexing to available hardware. All use BGE-M3 for consistent embedding quality—only batch size and speed differ:
+Since ADR-028 the user-facing switch is `mode` in `.archilles/config.json` (`auto | light | full-local | full-external`), resolved together with the detected hardware into an `ExecutionPlan`. The three profiles below remain as a legacy override (`--profile`). All use BGE-M3 for consistent embedding quality—only batch size and speed differ:
 
 | Profile | GPU VRAM | Batch Size | Speed | Use Case |
 | --- | --- | --- | --- | --- |
@@ -207,14 +231,19 @@ The central storage backend for book content. `LanceDBStore` provides:
 | `text` | str | Chunk text content |
 | `vector` | float\[1024\] | BGE-M3 embedding |
 | `book_id`, `book_title`, `author`, `publisher`, `year` | —   | Book metadata |
-| `calibre_id` | int | Calibre internal book ID |
+| `calibre_id`, `source_id` | int, str | Calibre internal book ID; adapter-agnostic document ID |
 | `tags`, `language` | str | Calibre tags, detected language |
 | `chunk_index`, `chunk_type` | —   | Position and type (content/parent/child/calibre_comment/annotation) |
 | `page_number`, `page_label` | —   | Physical page + printed label ("xiv", "62") |
 | `chapter`, `section`, `section_title`, `section_type` | —   | Structural metadata |
 | `char_start`, `char_end`, `window_text` | —   | Context expansion (Small-to-Big) |
 | `parent_id` | str | Parent chunk reference (hierarchical chunking) |
-| `source_file`, `format`, `indexed_at` | —   | Technical metadata |
+| `annotation_type`, `annotation_source`, `annotation_hash` | str | Annotation rows; hash for change detection |
+| `source_file`, `format`, `indexed_at` | —   | Technical metadata. `source_file` is the book file, even where the text came from a Scriptor bundle or a Calibre conversion (rows written before September 2026 may still name the conversion's temporary file); `format` is what the text was (`scriptor` for a bundle) |
+| `metadata_hash` | str | Calibre metadata hash for change detection (watchdog) |
+| `pipeline_version` | str | Generation of the pipeline that wrote the row (`''` = before the marker existed) |
+| `region`, `label_source`, `producer_version` | str | Scriptor provenance: region name beside `section_type`, the witness behind `page_label`, the prepared-format version of the master; `''` for every other row |
+| `pending_external` | int | 1 = provisionally light, waiting for an external hierarchical re-embed (ADR-028) |
 
 The `add_processed_documents()` method bridges `ProcessedDocument` objects from the modular pipeline directly into LanceDB storage.
 
@@ -302,7 +331,7 @@ Both transports expose the same tools via the same `CalibreMCPServer` and `creat
 
 > The unified multi-library server (`src/calibre_mcp/unified_server.py`) exposes the same tool set with adapter-aware gating: `detect_duplicates` and `watchdog_scan` are Calibre-only (`_CALIBRE_ONLY_TOOLS`), while aggregation tools and `set_research_interests`/`get_book_details` accept an optional `source`.
 
-Each search result includes sufficient metadata for academic citation: author, title, year, and either page number/page label (PDF) or chapter/section (EPUB).
+Each search result includes sufficient metadata for academic citation: author, title, year, and either page number/page label (PDF) or chapter/section (EPUB). A result read from a Scriptor bundle also carries `label_source`; a label that was inferred rather than printed is flagged in the CLI output and reaches Claude's prompt as `Page: 88 (inferred)` (citation contract: `WATCHDOG_AND_WIKI.md` §II.5/§II.6).
 
 #### Web UI (`scripts/web_ui.py`)
 
@@ -366,30 +395,38 @@ Idempotent PowerShell installer that registers six tasks under the current user 
 ### Indexing Flow
 
 ```
-Book file (PDF/EPUB/TXT/HTML/...)
+Book file (PDF/EPUB/TXT/HTML/...) — the book's identity throughout
+        │
+        ▼
+Text source (Indexer._text_source)
+  • the book's Scriptor bundle, if <library>/.archilles/scriptor/<key>/ holds one
+  • otherwise the book file itself
         │
         ▼
 FormatDetector → select appropriate Extractor
         │
         ▼
 Text extraction with metadata enrichment
+  • Scriptor master: page markers → page_label (+ page_number, label_source
+         from the pagination sidecar), regions → section_type/region,
+         headings → chapter/section_title, footnotes bound per chunking_strategy
   • PDF: CropBox filtering, page label extraction, footnote detection,
          TOC-to-page mapping (chapter/section_title), running footer removal
   • EPUB: TOC parsing, section classification (front/main/back matter, title-based)
   • TXT: YAML frontmatter stripping (for Obsidian vault imports)
-  • Other: CalibreConverter → intermediate format → extraction
+  • Other: CalibreConverter → EPUB/PDF → extraction
         │
         ▼
-Calibre metadata lookup (read-only from metadata.db)
+Calibre metadata lookup (read-only from metadata.db, via the book file)
   • title, author, year, publisher, tags, custom fields
   • language auto-detection via Lingua on extracted text
         │
         ▼
-Chunking (SemanticChunker or FixedSizeChunker via Registry)
-  • Configurable size (default: 512 tokens in profiles, 1000 in legacy)
+Chunking inside the extractor (BaseExtractor; ScriptorExtractor its own)
+  • paragraphs gathered up to chunk_size (IndexRecipe), oversized ones split
   • window_text for context expansion
-  • section_type assigned per chunk
-  • page_label mapped per chunk (PDF)
+  • section_type, page_label, chapter/section_title carried per chunk
+  • optional parent/child grouping (--hierarchical, or mode → ExecutionPlan)
         │
         ▼
 BGE-M3 embedding generation (1024 dimensions)
@@ -483,21 +520,24 @@ archilles/
 │   │   ├── obsidian_adapter.py    # Obsidian vault (Markdown + YAML)
 │   │   └── folder_adapter.py      # Plain directory fallback
 │   │
-│   ├── archilles/                 # Modular pipeline infrastructure
-│   │   ├── engine/                # Core RAG engine
+│   ├── archilles/                 # Engine and indexing infrastructure
+│   │   ├── engine/                # Core RAG engine (the production path)
 │   │   │   ├── core.py            # ArchillesRAG facade (composition + delegators)
-│   │   │   ├── indexing.py        # Indexer (index/prepare/embed, metadata, hashing)
+│   │   │   ├── indexing.py        # Indexer (index/prepare/embed, metadata, hashing, bundle text source)
 │   │   │   ├── search.py          # Searcher (4 search modes, result formatting)
 │   │   │   └── prompting.py       # PromptBuilder (Claude prompts, XML, markdown export)
-│   │   ├── pipeline.py            # ModularPipeline orchestration
-│   │   ├── profiles.py            # Hardware profiles (minimal/balanced/maximal)
+│   │   ├── book_files.py          # discover_formats, Scriptor bundle master lookup
+│   │   ├── scriptor_build.py      # The four admission conditions for a Scriptor bundle
+│   │   ├── pipeline_version.py    # Generation marker written into every row
+│   │   ├── pipeline.py            # ModularPipeline (experimental, behind --use-modular-pipeline)
+│   │   ├── profiles.py            # IndexRecipe, legacy hardware profiles
 │   │   ├── hardware.py            # Hardware detection (GPU, VRAM)
-│   │   ├── parsers/
+│   │   ├── parsers/               # experimental path only
 │   │   │   ├── base.py            # DocumentParser ABC, ParsedDocument
 │   │   │   ├── pymupdf_parser.py  # PDF parser
 │   │   │   ├── epub_parser.py     # EPUB parser
 │   │   │   └── registry.py        # ParserRegistry
-│   │   ├── chunkers/             # selected by strategy (no registry)
+│   │   ├── chunkers/             # experimental path only; selected by strategy (no registry)
 │   │   │   ├── base.py            # TextChunker ABC, TextChunk, ChunkerConfig
 │   │   │   ├── fixed.py           # FixedSizeChunker
 │   │   │   ├── semantic.py        # SemanticChunker (sentence + heading aware)
@@ -516,6 +556,7 @@ archilles/
 │   │   ├── universal_extractor.py # Delegates to format-specific extractors
 │   │   ├── pdf_extractor.py       # PyMuPDF: CropBox, page labels, TOC mapping, footer removal
 │   │   ├── epub_extractor.py      # ebooklib: TOC + section metadata (title-based classification)
+│   │   ├── scriptor_extractor.py  # Scriptor bundle: master + pagination sidecar (via scriptor.document)
 │   │   ├── txt_extractor.py       # Plain text (+ YAML frontmatter stripping)
 │   │   ├── html_extractor.py      # HTML document extraction
 │   │   ├── ocr_extractor.py       # Tesseract OCR integration
@@ -551,11 +592,14 @@ archilles/
 │   ├── rag_demo.py                # Thin CLI wrapper around the engine (search, index, export)
 │   ├── web_ui.py                  # Streamlit Web UI
 │   ├── batch_index.py             # Batch indexing with tag/author filters
+│   ├── scriptor_prepare.py        # Builds, judges and indexes Scriptor bundles
 │   └── chunk_inspector.py         # Diagnostic: chunk quality, boundaries, TOC alignment
 │
 ├── .archilles/                    # Per-library data (inside library folder)
 │   ├── config.json                # User configuration
-│   └── rag_db/                    # LanceDB database (all chunks: content + annotations)
+│   ├── rag_db/                    # LanceDB database (all chunks: content + annotations)
+│   └── scriptor/<key>/            # Scriptor bundles: master, review copy, sidecars
+│                                  #   (source, not derivative: back it up)
 │
 └── docs/
     ├── DECISIONS.md               # Strategic + technical decision log
@@ -575,6 +619,8 @@ All configuration is stored in `.archilles/config.json` inside the user's Calibr
 | `preload_models` | `true` | Warm the RAG stack (embedding model, reranker) in a background thread at MCP server start, so the first search does not hit MCP client tool-call timeouts |
 | `reranker_device` | `"cpu"` | Device for reranker (`"cpu"` or `"cuda"`) |
 | `rag_db_path` | `.archilles/rag_db` | Custom path for LanceDB database |
+| `mode` | `auto` | Indexing path: `auto`, `light`, `full-local`, `full-external` (ADR-028) |
+| `scriptor.chunking` | `"scientific"` | Chunking strategy Scriptor declares in the bundles `scriptor_prepare.py` builds: `scientific` keeps each footnote with its anchor paragraph, `basic` drops the definitions |
 | `library_path` | (env var) | Override for ARCHILLES_LIBRARY_PATH |
 | `transport.mode` | `"stdio"` | MCP transport: `"stdio"` or `"sse"` |
 | `transport.host` | `"127.0.0.1"` | SSE bind address (localhost only) |
@@ -606,9 +652,9 @@ When connected to an external LLM via MCP, the search results (text chunks with 
 
 The architecture is designed with explicit extension zones for future development:
 
-**Extractors:** New format support (specialized XML schemas, proprietary formats) can be added by implementing the `BaseExtractor` interface and registering with `UniversalExtractor`. `CalibreConverter` already bridges to 30+ formats via Calibre's ebook-convert.
+**Extractors:** New format support (specialized XML schemas, proprietary formats) can be added by implementing the `BaseExtractor` interface and registering with `UniversalExtractor`. This is the extension point production uses; the Scriptor import is built there. `CalibreConverter` already bridges to 30+ formats via Calibre's ebook-convert.
 
-**Pipeline components:** The Registry pattern in `src/archilles/` allows runtime registration of new parsers, chunkers, and embedders. New components implement the ABC (`DocumentParser`, `TextChunker`, `TextEmbedder`) and register via the corresponding registry.
+**Pipeline components:** Embedders implement `TextEmbedder`, annotation sources register in the `AnnotationProviderRegistry`. The parser and chunker ABCs (`DocumentParser`, `TextChunker`) belong to the experimental modular pipeline (section 3) and reach production only through it.
 
 **Embedding models:** BGE-M3 is the current default. The `BGEEmbedder` already supports multiple BGE variants; evaluation of multilingual-e5 and jina-embeddings-v3 is planned for Q2 2026.
 

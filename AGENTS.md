@@ -19,6 +19,7 @@ pip install -r requirements.txt
 ```bash
 python scripts/rag_demo.py index "/path/to/book.pdf" --book-id "AuthorName"
 python scripts/batch_index.py --tag "Your-Tag" [--dry-run] [--skip-existing]
+python scripts/scriptor_prepare.py --tag "Your-Tag" [--dry-run] [--no-index]   # Scriptor bundles
 ```
 
 ### Searching
@@ -31,7 +32,7 @@ python scripts/rag_demo.py list-indexed
 
 ### Web UI
 ```bash
-python scripts/web_ui.py
+streamlit run scripts/web_ui.py
 ```
 
 ### MCP Server (Claude Desktop)
@@ -46,18 +47,24 @@ flake8 src/ scripts/   # linting
 pytest                 # tests
 ```
 
+## Conventions
+
+All source code — comments, docstrings, identifiers, log/error messages and test prose — is written in **English**. German is allowed only where it is data, not code: user-facing locale strings (e.g. `src/archilles/i18n.py`) and the docs under `docs/` that are intentionally German (`DECISIONS.md`, `ROADMAP.md`).
+
 ## Architecture
 
 The system follows a layered pipeline:
 
 ```
-Calibre Library (read-only SQLite)
+Library (Calibre, read-only SQLite; Zotero, Obsidian, folders via adapters)
     ↓
-Extractors (PDF/EPUB/TXT/HTML/MOBI/DJVU/OCR)
+Text source: the book file, or its Scriptor bundle (<library>/.archilles/scriptor/<key>/)
     ↓
-Modular Pipeline: ParserRegistry → ChunkerRegistry → EmbedderRegistry
+Extractors (PDF/EPUB/Scriptor/TXT/HTML; MOBI/DJVU via Calibre conversion; OCR) — they also chunk
     ↓
-LanceDB (hybrid: dense vectors + BM25 FTS)
+Indexer (src/archilles/engine): Calibre metadata, BGE-M3 embedding, write
+    ↓
+LanceDB (one `chunks` table; hybrid: dense vectors + BM25 FTS)
     ↓
 Retriever (RRF fusion + optional cross-encoder reranking)
     ↓
@@ -69,13 +76,15 @@ Consumers: MCP Server | Web UI (Streamlit) | CLI
 ### Key Modules
 
 - **`src/calibre_db.py`** — Read-only access to Calibre's `metadata.db` (SQLite). This is an absolute boundary: never write to the Calibre library.
-- **`src/extractors/`** — Format-specific extractors. PDF uses PyMuPDF primary with pdfplumber fallback. EPUB uses ebooklib with TOC-based section classification.
-- **`src/archilles/pipeline.py`** — `ModularPipeline` orchestrates Parser → Chunker → Embedder using registry-based components.
-- **`src/storage/lancedb_store.py`** — LanceDB backend. Stores 1024-dim BGE-M3 vectors with rich metadata. Two tables: `chunks` (main content) and `annotations` (user highlights/notes).
 - **`src/service/archilles_service.py`** — Single facade used by MCP server, web UI, and CLI. Start here when adding new features.
-- **`src/calibre_mcp/server.py`** — MCP server exposing 10 tools (search, metadata, citations, annotations, stats). Carefully manages stdout/stderr to avoid JSON-RPC protocol corruption.
+- **`src/archilles/engine/`** — Core RAG engine (`ArchillesRAG` facade composing `Indexer`, `Searcher`, `PromptBuilder`). `Indexer.index_book`/`prepare_book` is the production indexing path. Start here for engine changes.
+- **`src/extractors/`** — Format-specific extractors, coordinated by `UniversalExtractor`; the extractor also chunks (`BaseExtractor`). PDF uses PyMuPDF with a pdfplumber fallback, EPUB uses ebooklib with TOC-based section classification, `scriptor_extractor.py` reads Scriptor bundles.
+- **The Scriptor seam** — `archilles-scriptor` is a hard runtime dependency in one direction: Archilles imports `scriptor.document` (the format reader), the marker grammar and the region vocabulary; Scriptor imports nothing from here. A bundle under `<library>/.archilles/scriptor/<key>/` replaces a book's *text source* in `Indexer._text_source`, never its identity — metadata, annotations and `source_file` stay with the book file. Bundles are built by `scripts/scriptor_prepare.py`. See `docs/DECISIONS.md` ADR-032.
+- **`src/archilles/pipeline.py`** — `ModularPipeline`: experimental since July 2026, reachable only behind `--use-modular-pipeline`, set by no routine. Not the production path; do not build on it (ADR-004, September addendum).
+- **`src/storage/lancedb_store.py`** — LanceDB backend. One `chunks` table for book content, annotations and Calibre comments, told apart by `chunk_type`; 1024-dim BGE-M3 vectors with rich metadata. New columns are added by schema migration with a default, so existing rows stay untouched.
+- **`src/calibre_mcp/server.py`** — MCP server exposing 13 tools (search, metadata, citations, annotations, stats). Carefully manages stdout/stderr: any stray write corrupts the JSON-RPC protocol.
 - **`mcp_server.py`** — Entry point for Claude Desktop MCP integration.
-- **`scripts/rag_demo.py`** — Primary CLI (2,479 lines). Index, query, stats, list-indexed.
+- **`scripts/rag_demo.py`** — Thin CLI around the engine. Index, query, stats, list-indexed.
 
 ### Search Architecture (Two-Stage)
 
@@ -86,7 +95,7 @@ Search modes: `hybrid` (default), `semantic`, `keyword`.
 
 ### Embeddings
 
-BGE-M3 via sentence-transformers: 1024 dimensions, multilingual (75+ languages). Three hardware profiles in `src/archilles/profiles.py`: `minimal` (batch=8), `balanced` (batch=16), `maximal` (batch=32).
+BGE-M3 via sentence-transformers: 1024 dimensions, multilingual (75+ languages). The indexing path is chosen by `mode` in `.archilles/config.json` (`auto | light | full-local | full-external`), resolved together with the detected hardware into an `ExecutionPlan` (ADR-028). The hardware profiles in `src/archilles/profiles.py` (`minimal` batch 8, `balanced` 32, `maximal` 64) remain as a legacy override.
 
 ### Configuration
 
@@ -95,19 +104,40 @@ Runtime config at `.archilles/config.json` inside the Calibre library:
 {
   "enable_reranking": true,
   "reranker_device": "cpu",
-  "rag_db_path": ".archilles/rag_db"
+  "rag_db_path": ".archilles/rag_db",
+  "embedder": {
+    "mode": "remote",
+    "host": "http://192.168.1.50:8900",
+    "port": 8900,
+    "token": "…",
+    "batch_size": 100,
+    "use_gzip": true
+  },
+  "scriptor": {
+    "chunking": "scientific"
+  }
 }
 ```
+
+The optional `embedder` block supplies defaults for the `embed` command (Phase 2 of two-phase indexing); CLI flags override it. Omit it for local embedding. The optional `scriptor` block sets the chunking strategy of the bundles `scriptor_prepare.py` builds.
 
 Environment variable: `ARCHILLES_LIBRARY_PATH` (legacy: `CALIBRE_LIBRARY_PATH` also accepted).
 
 ## Registry Pattern
 
-Parsers, chunkers, and embedders all use a registry pattern (`registry.py` in each subpackage). When adding a new extractor or chunker, register it in the appropriate registry rather than modifying pipeline logic directly.
+New input formats belong in `src/extractors/`: a `BaseExtractor` subclass that `UniversalExtractor` dispatches to. That is the production path, and the Scriptor import is built there (ADR-032).
+
+Formal registries exist only where selection is a real runtime dispatch, both on the generic `BaseRegistry[T]` (`src/archilles/registry.py`):
+- `AnnotationProviderRegistry` (annotation sources) is in production.
+- `ParserRegistry` (`parsers/registry.py`, by file format) serves only the experimental `ModularPipeline`. Do not dock new features there.
+
+Chunkers and embedders have no registry; their openness comes from the `TextChunker`/`TextEmbedder` ABCs.
 
 ## Chunk Schema
 
-Each chunk stored in LanceDB includes: calibre_id, title, author, tags, language, page_number, page_label, section_type (`main`/`front_matter`/`back_matter`), section_title, window_text (for Small-to-Big retrieval), and metadata_hash for deduplication. Sections are filtered to `main` by default to exclude bibliography/index noise.
+Each row carries book metadata (`calibre_id`/`source_id`, title, author, tags, language), its address (`page_number`, `page_label`, `chapter`, `section_title`), `section_type` (`main_content`/`front_matter`/`back_matter`), `window_text` for Small-to-Big retrieval, change-detection hashes (`metadata_hash`, `annotation_hash`) and `pipeline_version`. Rows read from a Scriptor bundle add `region`, `label_source` and `producer_version`.
+
+Non-obvious default: searches filter to `section_filter='main'` (main content or unclassified), which excludes front matter, bibliography and index noise.
 
 ## Important Docs
 

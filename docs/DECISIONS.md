@@ -2,7 +2,7 @@
 
 **Dokumenttyp:** Lebende Referenz für strategische und technische Entscheidungen
 **Erstfassung:** 13. Februar 2026
-**Letzte Überarbeitung:** 15. August 2026 (ADR-029 und ADR-030 aus den Juli-Entwürfen übernommen)
+**Letzte Überarbeitung:** 11. September 2026 (ADR-032 Naht Scriptor → Archilles; Nachtrag zu ADR-004)
 **Zweck:** Jede neue Claude-Session, jeder künftige Contributor und Tom selbst in drei Monaten sollen verstehen, *warum* ARCHILLES so gebaut ist, wie es gebaut ist.
 
 ---
@@ -156,6 +156,8 @@ Als konkrete Implementierungsoption wird **Docling** (IBM, Open Source, lokal la
 **Implementierungsstand (aktualisiert Juni 2026, P2-Etappe 5):** Das Registry-Pattern wird dort eingesetzt, wo Selektion ein echter Dispatch ist — nicht flächendeckend. Im Code existieren zwei formale Registries auf der generischen Basis `BaseRegistry[T]` (`src/archilles/registry.py`): `ParserRegistry` (Dispatch nach Dateiformat: `PyMuPDFParser`, `EPUBParser`) und `AnnotationProviderRegistry` (Annotation-Quellen). Chunker und Embedder haben **keine** Registry mehr: Der Chunker wird per Frontmatter-Strategie direkt selektiert (`pipeline._select_chunker`), der Embedder per Hardware-Profil (`pipeline._create_embedder_from_profile`). Ihre Offenheit kommt aus den ABCs `TextChunker`/`TextEmbedder` — eine neue Variante ist eine einzige Klasse.
 
 Diese Korrektur geht auf das Code-Review (10. Juni 2026, Befund 3.13) zurück: Die ursprünglich angelegten `ChunkerRegistry` und `EmbedderRegistry` wurden als „tote Infrastruktur, die Erweiterbarkeit vortäuscht" identifiziert und in P2-Etappe 5 entfernt. Das Leitprinzip „weniger Code, mehr Architektur" gilt auch für Registries: Offenheit gehört dorthin, wo sie real genutzt wird, nicht als Zeremonie über jede Komponente. Die `ModularPipeline` (`pipeline.py`) orchestriert weiterhin den Dreischritt Parser → Chunker → Embedder. Parallel dazu existieren die Extractors (`src/extractors/`) als eigenständige Schicht für die Rohtextextraktion, koordiniert durch `UniversalExtractor` mit `FormatDetector`.
+
+**Nachtrag (September 2026): Der Modularpfad ist stillgelegt, nicht der Produktionspfad.** Am 4. Juli 2026 wurde die `ModularPipeline` als experimentell markiert (`f010b5f`). Sie läuft nur hinter `--use-modular-pipeline`, und keine Routine setzt das Flag. Die Begründung im Commit: Der Pfad ist nicht in `ExecutionPlan`, hierarchisches Chunking und Spracherkennung integriert, lädt einen zweiten Embedder neben den schon geladenen und überspringt `metadata_hash` und Annotations-Chunks, bleibt also für die Änderungserkennung des Watchdogs unsichtbar. Ausdrücklich: *„do NOT attempt full integration."* Produktiv indexiert `Indexer.index_book`/`prepare_book` (`src/archilles/engine/indexing.py`): `UniversalExtractor` → formatspezifischer Extraktor, der selbst chunkt (`BaseExtractor`) → BGE-M3. Eine Messung vom 9. September 2026 fand in keinem der drei Stores eine einzige Zeile, die der `DialogueChunker` geschrieben hätte. Die Extraktor-Schicht ist damit der Erweiterungspunkt, den neue Formate tatsächlich benutzen; der Scriptor-Import ist bewusst dort gebaut (ADR-032). Weiter produktiv sind `embedders/` (externer Embedding-Pfad, Annotationen) und `registry.py` (Basis der `AnnotationProviderRegistry`). Ob `pipeline.py`, `parsers/` und `chunkers/` entfernt werden, ist offen (Naht-Schritt S11). Die Frage dahinter ist inhaltlich, nicht architektonisch: ob Dialog-Exporte an Sprecherwechseln geschnitten werden sollen.
 
 ### ADR-005: Keine direkte Modifikation von Calibres metadata.db
 
@@ -622,6 +624,75 @@ Der stdio-Pfad benutzt — anders als SSE und Streamable HTTP (ADR-024) — kein
 **Verworfen:** LongMemEval und andere öffentliche Benchmarks (falscher Problemraum: Konversations-Memory statt Bibliotheks-Retrieval); LLM-as-Judge in v1 (Kosten, Reproduzierbarkeit, Hardware); Voll-Reindex des Bestands vor der Teilbestand-Evidenz (teuerste Operation des Systems auf Verdacht); ein „publikationsreifes" akademisches Benchmark als Erstziel (Scope-Falle — erst Messinstrument, dann Politur); eine eigens gebaute „generisches RAG"-Vergleichs-Baseline in v1 (als Kommunikations-Asset attraktiv, aber ein zweites Retrieval-System zu bauen ist exakt die Scope-Falle — vertagt auf nach v1; bis dahin trägt der interne A/B-Vergleich flach vs. hierarchisch die Beweislast). Als Embedding-Kandidaten verworfen: nomic-embed-text (leichter, aber messbar unter BGE-M3-Qualität — der falsche Tausch für ein Präzisions-Produkt; als Empfehlung für CPU-only-*Nutzer* dokumentierbar, nicht als Identität) und Modell2Vec/Potion-Modelle (statische Embeddings, extrem schnell, aber die Qualitätsklasse passt nicht zum Kernversprechen).
 
 **Umsetzungsstand (August 2026): nicht begonnen.** Es existiert weder `benchmarks/` noch ein Runner. Nicht zu verwechseln mit dem Evaluations-Harness in `archilles-scriptor` (`eval/`, `src/scriptor/eval/`): Der misst die *Aufbereitung* (Seitenlabels, Anker, Regionen, Zitate gegen handausgezeichnete Ground Truth je Band), dieser hier misst die *Abfrage*. Berührungspunkt ist allein die Citation Integrity aus Komponente 2 — dort ist Scriptor der Eigentümer der Wahrheit (siehe `WATCHDOG_AND_WIKI.md` §II.5/§II.6), und Archilles sollte sie konsumieren statt herleiten.
+
+---
+
+### ADR-032: Die Naht Scriptor → Archilles — Zulieferer mit reichem Kontrakt, Abhängigkeit in einer Richtung (September 2026)
+
+**Kontext:** `archilles-scriptor` bereitet gedruckte Bücher aus PDF zu einem *Prepared Document* auf (`PREPARED_FORMAT_SPEC.md`, v0.3.0). Das ist ein Markdown-Master mit Seitenmarkern im gedruckten Label (`[p. 88]`), Regionsmarkern (`[region: bibliography]`) und gebundenen Fußnoten, dazu Sidecars; `<master>.pagination.json` trägt je Seite die physische Position und die Herkunft des Labels. Am 10. August 2026 hat Archilles selbst Regionen und ein Chunking-Profil angefordert (Anlass: Register, Anmerkungsapparate und Titelei in inhaltlichen Treffern). Scriptor hat am selben Tag geliefert. Einen Monat später las Archilles keine Zeile davon.
+
+Der Befund vom 9. September 2026 (`archilles-scriptor/docs/internal/NAHT_SCRIPTOR_ARCHILLES_2026-09.md`) fand drei strukturelle Gründe, keinen Aufschub:
+1. Die Anforderung zeigte auf `pipeline._select_chunker` im stillgelegten Modularpfad (ADR-004, Nachtrag). Der Produktionspfad las ein Scriptor-Markdown als TXT und warf das Frontmatter ungelesen weg; Seiten- und Regionsmarker gingen als gewöhnliche Zeichen ins Embedding.
+2. Archilles hatte keinen Eingang, durch den ein aufbereiteter Band zu seinem Calibre-Buch fände (`.md` an sechster Stelle der Formatliste, Sidecars sind keine Calibre-Formate). Möglich war nur eine Dublette im Lab-Vault mit eigener ID.
+3. Der Konsument für die Herkunft eines Seitenlabels existierte, war aber tot: `_resolve_page_info` las `printed_page`/`printed_page_confidence`, die niemand schrieb.
+
+Die Dokumentation (`AGENTS.md`, `ARCHITECTURE.md`) beschrieb zudem den stillgelegten Pfad als den laufenden. Die Anforderung war aus ihr geschrieben.
+
+**Entscheidung: Modell (a+).** Scriptor bleibt ein eigenständiges Repository mit eigener CLI und eigenem Vertrag; es hat drei Abnehmer (Retrieval, Übersetzung im Archillator, Markdown-Konversion), Archilles ist einer davon. Archilles liest das Bündel über einen `ScriptorExtractor` in der Extraktor-Schicht (`src/extractors/scriptor_extractor.py`) und nimmt `archilles-scriptor` als **harte Laufzeitabhängigkeit in einer Richtung** auf. Es importiert den Leser des Formats (`scriptor.document`), die Markergrammatik und das Regionsvokabular, statt sie zu kopieren. Scriptor importiert nichts aus Archilles. Die Formatwahl bleibt je Buch; einen Modus-Schalter „einfach/hochwertig" gibt es nicht.
+
+**Kriterien, an denen die Entscheidung zu prüfen ist:**
+- K1: Der Vertrag bleibt für den Archillator unverändert.
+- K2: Scriptor ist ohne Archilles installier- und nutzbar.
+- K3: Jede geteilte Funktion liegt in genau einem Repo, das andere importiert sie.
+- K4: Jede Indexzeile sagt, wer sie erzeugt hat und nach welcher Spec-Version.
+- K5: Ein Buch lässt sich auf den alten Pfad zurücksetzen, ohne andere Bücher anzufassen.
+- K6: Die CPU-Kosten je Buch sind gemessen, die GPU-Kosten unverändert.
+- K7: Keine Archilles-spezifische Syntax ist ins Markdown gewandert.
+
+**Umsetzung (Schritte S1–S6, 9.–11. September 2026):**
+- **Das Bündel ist Textquelle, kein Format.** Es liegt unter `<Bibliothek>/.archilles/scriptor/<key>/` (numerische Buch-IDs fünfstellig nullgefüllt, damit ein Verzeichnislisting in Bibliotheksordnung läuft). Es enthält genau einen Master, nicht `*.review.md`; zwei Kandidaten werden verweigert, nicht gewählt. `Indexer._text_source` tauscht in `index_book` und `prepare_book` nur die Textquelle (`d7cf012`). Die Buchdatei bleibt die Identität: Über sie findet Archilles die Calibre-Metadaten (Buchordner) und die Viewer-Annotationen (SHA256 des Dateipfads), auf sie verweisen Export-Link und `source_file` (`7f859c6`). Der Befund hatte das Bündel als weiteres Format in der Qualitätswahl (ADR-014) vorgesehen; das hätte dem Buch Autor, Titel, Tags und Annotationen genommen. Dieselbe Regel gilt für Zotero (`67f8bfd`).
+- **Drei Spalten:** `region`, `label_source`, `producer_version`, Default `''` (`11cf1db`). Gespeichert wird das Signal neben dem Ergebnis, die Lehre aus der Anforderung vom August: Ein Reparaturversuch an einem Index, der nur `section_type` kannte, traf 50.670 statt 3.345 Chunks. Mit `region` ist eine geänderte Abbildung ein Metadatenlauf, kein Reindex. `producer_version` ist wie `pipeline_version` gegen `update_metadata_fields` gesperrt.
+- **Die physische Seite reist über den Sidecar** (`pages[].pos`), nicht über eine neue Markerform. Grenze dieser Entscheidung: Eine Seite ohne gedrucktes Label hinterlässt im Text keinen Marker, ihr Text steht unter der Adresse der Vorseite. Die Antwort darauf ist eine Zulassungsbedingung (siehe unten, `inherited`), keine neue Syntax.
+- **Region → `section_type`:**
+
+  | Region | `section_type` |
+  |---|---|
+  | `front-matter`, `contents` | `front_matter` |
+  | `preface` | `main_content` (Entscheidung vom 10.9.2026: Vorworte werden suchbar, Danksagungen darunter hingenommen) |
+  | `main`, unmarkiert | `main_content` |
+  | `bibliography`, `index`, `abbreviations`, `notes`, `appendix` | `back_matter` |
+  | unbekannter Name | `main_content`, der Name verbatim in `region` |
+
+- **Der Ausgang liest `label_source`** (`a7cfcb8`, `a54a1e5`). Keine Warnung bei `printed`, `link`, `toc`, `catalogue` und bei Zeilen ohne Scriptor. Bei `computed` und unbekannten Werten erscheint eine Warnung, im Prompt steht dann `Page: 88 (inferred)`, und der System-Prompt verpflichtet das Abnehmer-LLM, den Umstand weiterzugeben. Beide MCP-Server liefern Seite und `label_source` über eine gemeinsame Funktion. Der tote `printed_page`-Zweig ist entfernt.
+- **Bündel entstehen durch `scripts/scriptor_prepare.py`, nicht im Watchdog** (`914a233`). Vier Zulassungsbedingungen je Band:
+  1. Der Text jeder PDF-Seite steht im Master: mindestens 98 % der Seiten, gemessen seitenweise über Acht-Wort-Fenster ohne Ziffern; der Vorspann, den Scriptor neu setzt, ist ausgenommen (`c691801`).
+  2. Mindestens so viele Fußnotendefinitionen wie sichere Fußnoten im Audit.
+  3. Mindestens 20 % bezeugte Seitenlabels.
+  4. Weniger als 5 % Text unter geerbter Seitenzahl (`profile.inherited`).
+
+  Gebaut wird in `_work/`; an seinen Platz kommt das Bündel erst nach bestandener Prüfung, ein abgelehnter Lauf landet in `_rejected/<key>/` und lässt Bündel und Index unangetastet. Der Bearbeitungsstand (vorbereitet / bearbeitet / freigegeben zur Indexierung) wird aus dem Hash des Masters abgeleitet, nicht gesetzt. Ein späterer Lauf holt den Index nach, wenn der Master ihn noch nicht erreicht hat.
+- **Abnahme (Goldene Kette):** Bauer [10593]: aufbereitet in 44 s, Deckung 100 %, 99 % bezeugt. Nach `index_book` zitiert die Suche nach einer Passage von S. 88 `S. 88` mit `label_source='printed'`. Titel, Autor, Tags, `calibre_id` und die fünf PDF-Annotationen blieben unverändert.
+
+**Versionsregel:** Der Extraktor versteht `SUPPORTED_SPEC_MAJOR = 0`. Minor-Versionen sind additiv und werden mit den Toleranzregeln der Spec gelesen: unbekannte Region → Fließtext, unbekannter `source`-Wert → behauptet, unbekanntes Frontmatter-Feld → ignoriert. Eine neue Major-Version wird mit Meldung **verweigert**, nie still indexiert. `format_version` steht je Zeile in `producer_version`; mit `format='scriptor'` und `pipeline_version` ist jede Population des Index lokalisierbar (K4). Ändert der Extraktor seine Chunk-Komposition, steigt `PIPELINE_VERSION`. Ein neu gerendertes Bündel ist neuer Text und löst die Neuindexierung dieses Buchs aus; zuständig ist das Skript, nicht der Watchdog.
+
+**Konsequenzen:**
+- Archilles' eigener PDF-Pfad bleibt als **eingefrorener Rückfall** für Bücher ohne Bündel. Er wird nicht weiter ausgebaut und ist über `format` von den Bündelzeilen unterscheidbar. Er verschwindet erst, wenn Scriptor mit OCR den Rest trägt.
+- Die Abhängigkeit koppelt die Releases: Ein Major-Sprung der Spec ist ein Ereignis für die ganze Familie (Spec §11). Ohne installiertes `archilles-scriptor` startet die Extraktion nicht; es gibt bewusst keinen Fallback-Code, denn Fallbacks wären Kopien.
+- Ein Bündel ist dauerhaft. Es wird bei jeder Neuindexierung gelesen, und der Master ist das, was der Nutzer von Hand nacharbeitet. Er ist Quelle, nicht Ableitung; die Sicherungsregel nimmt `.archilles/scriptor` deshalb aus der sonst reproduzierbaren Zone `.archilles` aus.
+- Der Parserpfad des Modularbaus hat keinen Kunden mehr (S11).
+
+**Verworfen:**
+- (b) ein `ScriptorParser` in der `ParserRegistry`: der stillgelegte Pfad, und eine statische Rangfolge statt der Messung je Buch.
+- (c) die Verschmelzung: Archilles ingestiert über zwanzig Formate, Annotationen und Calibre-Konversionen; Spec und Benchmark sollen ein eigenständiges Asset bleiben.
+- Eine neue Markerform für die physische Seite (`[p. ~7]`).
+- Spalten für `label_confidence`, `attested` oder Regionskonfidenz, weil ihnen ein Konsument fehlt.
+- Die Wortbilanz gegen den PDF-Pfad als Zulassungsbedingung: Scriptor entfernt Kolumnentitel und Fußzeilen absichtlich, jeder Band verliert dadurch 4–5 % Wörter, auch der fehlerfreie.
+
+**Offen:**
+- **Die Gliederung.** Durch die Naht gehen nur zwei flache Felder (`chapter`, `section_title`), und der EPUB-Pfad füllt sie nicht besser als der PDF-Pfad. Das gemeinsame Regionsvokabular für den EPUB-Rückfall (S7) geht deshalb in einem Gliederungsmodell auf, das seit dem 11. September 2026 entworfen wird (Messung `docs/internal/naht-2026-09/G1_ERGEBNIS_2026-09-11.md`).
+- **OCR:** Das Tesseract-Backend auf Scriptors Seitenmodell (S8), danach Scans zu Scriptor (S9).
+- **Seitenbereich je Chunk:** Ein Chunk zitiert die Seite seines ersten Zeichens; ob der Ausgang einen Bereich zeigen soll, entscheidet der Nutzer.
+- **Spec-Sätze:** die Regel „Überschrift vor Marker" und `pages[].pos` als Kanal der physischen Seite gehen mit der nächsten Spec-Version.
 
 ---
 

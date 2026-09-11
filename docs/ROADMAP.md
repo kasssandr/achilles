@@ -3,7 +3,7 @@
 > **Your Intelligent Research Archive**
 > *Mein Korpus, meine Wahl.*
 
-**Last updated:** Juli 2026
+**Last updated:** September 2026
 
 > **Spiegel-Notiz (Familie), 2026-07-19:** Scriptor S1 ist umgesetzt — das
 > Übergabeformat der Familie ist als versionierte Spezifikation normiert:
@@ -23,6 +23,17 @@
 > unbekannter Wert darf den Importer nicht scheitern lassen. Der Kontrakt steht
 > normativ in [WATCHDOG_AND_WIKI.md §II.6](WATCHDOG_AND_WIKI.md); Begründung und
 > Messwerte in Scriptors `docs/internal/2026-08-13-quellen-verbund-design.md`.
+
+> **Erledigt, 2026-09-11:** Beide Spiegel-Notizen sind umgesetzt (Naht
+> Scriptor → Archilles, Schritte S1–S6; [ADR-032](DECISIONS.md)). Der Import
+> läuft als Format `scriptor` über einen eigenen Extraktor; das Bündel ersetzt
+> nur die Textquelle eines Buchs, nicht seine Identität. `label_source`,
+> `region` und `producer_version` stehen im Chunk-Schema, unbekannte Werte
+> werden nach den Toleranzregeln der Spec gelesen. Die Abnahme nach Spec §12 ist
+> bestanden: Bauer [10593] zitiert eine Passage von S. 88 als `S. 88`,
+> `label_source = printed`. Offen aus der Naht: OCR (S8/S9, siehe v1.2) und das
+> Gliederungsmodell, in dem das gemeinsame Regionsvokabular für den EPUB-Pfad
+> (S7) aufgeht.
 
 ---
 
@@ -164,6 +175,13 @@ Für gewöhnlich bringt der größere Teil der PDFs eines gewachsenen Bestands j
 **Vision-Language-OCR (Sonderfall, nicht Primärpfad):** Modelle wie olmOCR-2 oder LightOnOCR-2 lesen Layout und Lesereihenfolge beeindruckend gut — und liefern Markdown. Keine Boxen, keine Zeichenkonfidenz. olmOCR-2 führt olmOCR-Bench mit 82,4 Punkten, fällt auf allgemeinen historischen Scans aber auf 47,7 %; und der Benchmark prüft in der Kategorie *Headers & Footers* ausdrücklich, ob Kopf- und Fußzeilen im Ergebnis **fehlen**. Dort steht die Seitenzahl. Was die Benchmark-Konstruktion belohnt, kostet Archilles den Zitationsanker. VLM-OCR bleibt deshalb der Kanal für Bände, die anders keinen lesbaren Text hergeben — mit dem ausdrücklichen Vermerk, dass Seitenanker und Fußnotenmarker dabei verloren gehen.
 
 Die `ocr_backend`-Konfiguration des `ArchillesService` (heute `auto/tesseract/lighton/olmocr`) spiegelt noch die frühere Annahme und wird mit der Implementierung nachgezogen.
+
+**Umsetzung über die Scriptor-Naht (Stand September 2026).** Die Engine wird nur einmal gebaut, in Scriptor. Der Zuschnitt ist gemessen (Messung M5 an drei gescannten Bänden).
+- **S8 (Scriptor):** Das Tesseract-Backend schreibt das Seitenmodell über hOCR, mit Zeilenklassen und der Schriftgröße je Zeile (`x_size`; die Wortboxhöhe verfehlt zwei Drittel der Fußnoten). Fehlende Sprachpakete meldet es laut, denn Tesseract lässt sie sonst still weg.
+- **S9 (Archilles):** `scriptor_prepare.py` erkennt Scans und reicht sie mit der Calibre-Sprache des Buchs an Scriptor weiter. Start sind die rund 173 Bände ohne Textlayer, eine Nacht CPU.
+- **Danach:** Der Tesseract-Klartextpfad in Archilles wird eingefroren, die VLM-Platzhalter und die Konfigwerte `lighton`/`olmocr` entfallen.
+
+Gewinn: Ein gescannter Band zitiert gedruckte Seitenlabels statt physischer Nummern, und `label_source` sagt, welche bezeugt sind.
 
 Die strategische Entscheidung: Die OCR-Landschaft entwickelt sich rasant, die Anforderung an ihre *Ausgabe* nicht. Die Schnittstelle wird sauber definiert — als Seitenmodell, nicht als Markdown-Kanal — und das beste Modell zum Implementierungszeitpunkt dahinter gehängt.
 

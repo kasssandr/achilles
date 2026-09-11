@@ -56,6 +56,7 @@ Non-obvious constraints and entry points (the rest of the layout is best read fr
 - **`src/calibre_db.py`** — Read-only access to Calibre's `metadata.db` (SQLite). This is an absolute boundary: never write to the Calibre library.
 - **`src/service/archilles_service.py`** — Single facade used by MCP server, web UI, and CLI. Start here when adding new features.
 - **`src/archilles/engine/`** — Core RAG engine (`ArchillesRAG` facade composing `Indexer`, `Searcher`, `PromptBuilder`). Start here for engine changes.
+- **Scriptor seam** — `archilles-scriptor` is a hard runtime dependency, one direction only. A bundle under `<library>/.archilles/scriptor/<key>/` replaces a book's *text source* (`Indexer._text_source`), never its identity. `src/extractors/scriptor_extractor.py` reads it, `scripts/scriptor_prepare.py` builds it (ADR-032).
 - **`src/calibre_mcp/server.py`** — MCP server. Carefully manages stdout/stderr: any stray write corrupts the JSON-RPC protocol.
 
 ### Search Architecture (Two-Stage)
@@ -90,9 +91,9 @@ Environment variable: `ARCHILLES_LIBRARY_PATH` (legacy: `CALIBRE_LIBRARY_PATH` a
 
 ## Registry Pattern
 
-Parsers use a registry pattern (`parsers/registry.py`, built on the generic `BaseRegistry[T]` in `src/archilles/registry.py`) because parser selection is a real dispatch by file format. When adding a new extractor/parser, register it in `ParserRegistry` rather than modifying pipeline logic directly.
+New input formats belong in `src/extractors/`: a `BaseExtractor` subclass that `UniversalExtractor` dispatches to. That is the production path — the extractor also chunks — and the Scriptor import is built there (ADR-032).
 
-Chunkers and embedders are selected directly (chunker by frontmatter strategy in `pipeline._select_chunker`; embedder by profile in `pipeline._create_embedder_from_profile`). Their openness comes from the `TextChunker`/`TextEmbedder` ABCs — a new variant is a single class. (A config-driven embedder selection layer, e.g. local ↔ remote GPU via `config.json`, is a deferred idea, not yet implemented.)
+Formal registries exist only where selection is a real dispatch, on the generic `BaseRegistry[T]` (`src/archilles/registry.py`): `AnnotationProviderRegistry` (annotation sources, production) and `ParserRegistry` (`parsers/registry.py`, by file format), which serves only the experimental `ModularPipeline` (`--use-modular-pipeline`, ADR-004 addendum) — do not dock new features there. Chunkers and embedders have no registry; their openness comes from the `TextChunker`/`TextEmbedder` ABCs.
 
 ## Chunk Schema
 

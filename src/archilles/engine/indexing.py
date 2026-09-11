@@ -108,10 +108,17 @@ class Indexer:
         book_metadata: Dict[str, Any],
         indexed_at: str,
         meta_hash: str,
+        source_file: Path | str | None = None,
     ) -> List[Dict[str, Any]]:
         """Build LanceDB chunk dicts from extracted chunks.
 
         Shared by index_book and prepare_book to avoid duplication.
+
+        ``source_file`` is the book's own file, which is not always the file the
+        text was read from: a Scriptor bundle supplies the text (Naht S4) and a
+        Calibre conversion reads a temporary EPUB. The book file is what the
+        row must name -- the Markdown export links it and the scanned-PDF scan
+        opens it. Omitted, the extracted file stands in, as before.
         """
         chunks = []
         for i, chunk in enumerate(extracted.chunks):
@@ -144,7 +151,7 @@ class Indexer:
             if meta_hash:
                 chunk_data['metadata_hash'] = meta_hash
 
-            chunk_data['source_file'] = str(extracted.metadata.file_path)
+            chunk_data['source_file'] = str(source_file or extracted.metadata.file_path)
 
             for src_key, dst_key in self._rag._CHUNK_META_KEYS:
                 if chunk_meta.get(src_key):
@@ -1080,7 +1087,8 @@ class Indexer:
         # Prepare chunks with metadata
         indexed_at = datetime.now().isoformat()
         meta_hash = self._resolve_metadata_hash(book_id, book_metadata)
-        chunks = self._build_chunk_dicts(extracted, book_id, book_metadata, indexed_at, meta_hash)
+        chunks = self._build_chunk_dicts(extracted, book_id, book_metadata, indexed_at,
+                                         meta_hash, source_file=book_path)
 
         # Collect extra embedding arrays for comments/annotations
         extra_embedding_arrays = []
@@ -1260,7 +1268,8 @@ class Indexer:
         # Step 2: Build chunk dicts (shared with index_book)
         indexed_at = datetime.now().isoformat()
         meta_hash = self._resolve_metadata_hash(book_id, book_metadata)
-        chunks = self._build_chunk_dicts(extracted, book_id, book_metadata, indexed_at, meta_hash)
+        chunks = self._build_chunk_dicts(extracted, book_id, book_metadata, indexed_at,
+                                         meta_hash, source_file=book_path)
 
         # Step 2b: Add Calibre comments as structured chunk(s) (if available)
         has_comment = bool(book_metadata and (book_metadata.get('comments') or book_metadata.get('comments_html')))

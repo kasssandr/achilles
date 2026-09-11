@@ -279,3 +279,28 @@ def test_index_book_finds_a_bundle_through_the_adapters_library(tmp_path):
     indexer = _indexer(extracted_from=[], metadata_from=[])
     indexer._rag._adapter = adapter
     assert indexer._text_source(pdf, "ABCD1234") == master
+
+
+# the row names the book, not the file the text came from -------------------------
+
+def test_a_chunk_row_names_the_book_file_not_the_bundle(tmp_path):
+    """The Markdown export links source_file and find_scanned opens it; both
+    want the book, and the bundle is only where the text was read."""
+    library, book_dir = _library(tmp_path)
+    master = _bundle(library)
+    indexer = _indexer(extracted_from=[], metadata_from=[])
+    extracted = _extraction(master)
+
+    rows = indexer._build_chunk_dicts(extracted, "10593", {}, "now", "",
+                                      source_file=book_dir / "book.pdf")
+    assert [r["source_file"] for r in rows] == [str(book_dir / "book.pdf")]
+    assert rows[0]["format"] == "scriptor"          # the text's format is still named
+
+
+def test_without_a_book_file_the_extracted_one_stands_in(tmp_path):
+    library, _book_dir = _library(tmp_path)
+    master = _bundle(library)
+    indexer = _indexer(extracted_from=[], metadata_from=[])
+
+    rows = indexer._build_chunk_dicts(_extraction(master), "10593", {}, "now", "")
+    assert rows[0]["source_file"] == str(master)

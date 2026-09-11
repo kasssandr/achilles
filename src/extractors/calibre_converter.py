@@ -177,6 +177,11 @@ class CalibreConverter:
                 '--chapter', '/',  # Don't split on chapters
                 '--max-toc-links', '0',  # Keep full TOC
                 '--preserve-cover-aspect-ratio',
+                # Never split by file size. The default of 260 KB exists for
+                # e-reader compatibility; we only read the EPUB once. Books
+                # whose markup offers no split point (long chapters without
+                # block-level structure) otherwise abort with SplitError.
+                '--flow-size', '0',
             ])
         elif target_format == 'pdf':
             cmd.extend([

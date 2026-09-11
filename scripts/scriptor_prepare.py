@@ -172,6 +172,15 @@ def _clear_dir(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _prune(*folders: Path) -> None:
+    """Remove the scratch folders once they hold nothing."""
+    for folder in folders:
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+
+
 def _move_bundle(work: Path, target: Path, keep_pages: bool) -> None:
     """Put a passed bundle where indexing looks for it.
 
@@ -224,6 +233,7 @@ def prepare_volume(
         _clear_dir(rejected)
         rejected.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(work), str(rejected))
+        _prune(scriptor_dir / WORK_FOLDER)
         return None, check, {"seconds": round(time.perf_counter() - started, 1)}
 
     run_seconds = round(time.perf_counter() - started, 1)
@@ -237,9 +247,13 @@ def prepare_volume(
         _clear_dir(rejected)
         rejected.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(work), str(rejected))
+        _prune(scriptor_dir / WORK_FOLDER)
         return None, check, timings
 
     _move_bundle(work, target, keep_pages)
+    # A volume that passes this time leaves no refused copy of itself behind.
+    _clear_dir(rejected)
+    _prune(scriptor_dir / WORK_FOLDER, scriptor_dir / REJECTED_FOLDER)
     return target / master.name, check, timings
 
 

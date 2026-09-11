@@ -614,3 +614,20 @@ def test_a_volume_with_nothing_left_to_check_is_unknown_not_empty(tmp_path):
     check = check_bundle(master, pdf)
     check.coverage = None
     assert "no page could be checked" not in "".join(check.reasons)   # measured above
+
+
+def test_a_volume_that_passes_leaves_no_refused_copy_behind(tmp_path, monkeypatch):
+    pdf = _pdf(tmp_path / "book.pdf", [PAGE_A, PAGE_B])
+    scriptor_dir = tmp_path / ".archilles" / "scriptor"
+
+    _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}"))            # refused
+    sp.prepare_volume({"id": "10593"}, pdf, scriptor_dir,
+                      chunking="scientific", keep_pages=False)
+    assert (scriptor_dir / sp.REJECTED_FOLDER / "10593").exists()
+
+    _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}"))
+    master, check, _t = sp.prepare_volume({"id": "10593"}, pdf, scriptor_dir,
+                                          chunking="scientific", keep_pages=False)
+    assert check.admitted and master is not None
+    assert not (scriptor_dir / sp.REJECTED_FOLDER).exists()
+    assert not (scriptor_dir / sp.WORK_FOLDER).exists()

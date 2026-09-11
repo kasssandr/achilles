@@ -73,6 +73,31 @@ def test_the_key_is_the_prepared_name_of_the_book_id(tmp_path):
     assert bundle_master(tmp_path / ".archilles", "folder:ab/cd") == master
 
 
+def test_a_numeric_id_is_padded_so_the_folders_sort_like_the_library(tmp_path):
+    """`150` between `1499` and `1500` is a listing nobody can read."""
+    from src.archilles.book_files import bundle_dir, bundle_key
+
+    assert [bundle_key(i) for i in ("7", "150", "1499", "10593")] ==         ["00007", "00150", "01499", "10593"]
+    assert bundle_dir(tmp_path, 150).name == "00150"
+
+    master = _bundle(tmp_path, key="00150")
+    assert bundle_master(tmp_path / ".archilles", "150") == master
+
+
+def test_an_id_above_the_padding_width_keeps_its_digits(tmp_path):
+    from src.archilles.book_files import bundle_key
+
+    assert bundle_key("100001") == "100001"
+
+
+def test_a_key_that_is_no_number_keeps_the_prepared_form(tmp_path):
+    """Zotero keys and folder ids have no order to preserve."""
+    from src.archilles.book_files import bundle_key
+
+    assert bundle_key("ABCD1234") == "ABCD1234"
+    assert bundle_key("folder:ab/cd").startswith("folder_ab_cd-")
+
+
 def test_markdown_without_a_format_version_is_no_master(tmp_path):
     _bundle(tmp_path, text="# Notizen\n\nNur ein Text.\n")
     assert bundle_master(tmp_path / ".archilles", "10593") is None

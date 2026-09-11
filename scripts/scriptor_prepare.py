@@ -49,7 +49,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.archilles.book_files import BUNDLE_FOLDER, bundle_dir, bundle_master, prepared_jsonl_name
+from src.archilles.book_files import BUNDLE_FOLDER, bundle_dir, bundle_key, bundle_master
 from src.archilles.config import (
     get_excluded_tags,
     get_languages,
@@ -211,7 +211,7 @@ def prepare_volume(
     """
     from src.archilles.scriptor_build import BundleCheck
 
-    key = prepared_jsonl_name(str(book_id))[: -len(".jsonl")]
+    key = bundle_key(book_id)
     work = scriptor_dir / WORK_FOLDER / key
     target = scriptor_dir / key
     rejected = scriptor_dir / REJECTED_FOLDER / key

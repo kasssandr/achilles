@@ -4,8 +4,8 @@
 watchdog and batch_index each kept a copy of it.
 
 ``bundle_master`` finds a book's prepared text. A Scriptor bundle lies in the
-library's extension zone (ADR-005), ``<library>/.archilles/scriptor/<key>/``,
-keyed like the book's prepared JSONL. It is not another format of the book: the
+library's extension zone (ADR-005), ``<library>/.archilles/scriptor/<key>/``
+(see ``bundle_key``). It is not another format of the book: the
 book file stays the book's identity -- Calibre metadata, viewer annotations
 (keyed by the file's path) and links follow it -- and only the text is read
 from the bundle, where indexing extracts (Naht S4).
@@ -31,6 +31,10 @@ _PREFERRED_FORMAT_SET = frozenset(PREFERRED_FORMATS)
 _UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 BUNDLE_FOLDER = 'scriptor'
+# A numeric book id is padded to this width so the bundle folders sort in id
+# order in any file listing. Five digits carry every id below 100.000.
+BUNDLE_KEY_DIGITS = 5
+_NUMERIC_ID = re.compile(r'^[0-9]+$')
 _MASTER_SUFFIXES = frozenset({'.md', '.markdown'})
 _REVIEW_SUFFIX = '.review.md'
 # Enough for the metadata block, which opens a master (spec §4.1).
@@ -101,9 +105,24 @@ def is_scriptor_master(file_path: Path) -> bool:
     return bool(block and block.get('format_version'))
 
 
+def bundle_key(book_id: str) -> str:
+    """The folder name a book's bundle lies under.
+
+    A numeric id is zero-padded to five digits, so a listing of the bundle
+    folder sorts the way the library does: book 150 is ``00150``, not ``150``
+    sitting between ``1499`` and ``1500``. An id that is not a number (a Zotero
+    key, a folder id) keeps the filesystem-safe form the prepared JSONL uses --
+    there is no order to preserve there.
+    """
+    text = str(book_id)
+    if _NUMERIC_ID.match(text):
+        return text.zfill(BUNDLE_KEY_DIGITS)
+    return prepared_jsonl_name(text)[:-len('.jsonl')]
+
+
 def bundle_dir(archilles_dir: Path, book_id: str) -> Path:
     """Where the bundle of ``book_id`` lies, whether or not it exists."""
-    return Path(archilles_dir) / BUNDLE_FOLDER / prepared_jsonl_name(book_id)[:-len('.jsonl')]
+    return Path(archilles_dir) / BUNDLE_FOLDER / bundle_key(book_id)
 
 
 def bundle_master(archilles_dir: Path, book_id: str) -> Path | None:

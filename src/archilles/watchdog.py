@@ -168,6 +168,43 @@ def _priority_match(
     return False
 
 
+def report_priority_tags(first_tags, items, results: dict | None = None) -> list[tuple[str, int]]:
+    """Say how many of the library's items each priority tag actually reaches.
+
+    A tag matches by exact name, so a renamed one simply stops matching and the
+    run goes on in the wrong order without a word. That happened: a routine kept
+    prioritising "Judenkoenige" months after the tag had been renamed to "BBB",
+    and 3.014 books lost their place in the queue to the ordinary backlog. The
+    count is the thing worth seeing -- a tag reaching one book is as wrong as a
+    tag reaching none, and only the number says so.
+
+    ``items`` is the metadata mapping the scanner already holds (Calibre books
+    or Zotero items); each value carries ``tags``.
+    """
+    if not first_tags:
+        return []
+    counts: list[tuple[str, int]] = []
+    for tag in first_tags:
+        wanted = tag.lower()
+        counts.append((tag, sum(
+            1 for data in items.values()
+            if any(t.lower() == wanted for t in data.get('tags', []))
+        )))
+    shown = ", ".join(f"{tag} ({n})" for tag, n in counts)
+    print(f"  Priority tags: {shown}")
+    empty = [tag for tag, n in counts if n == 0]
+    if empty:
+        message = (f"Priority tag(s) {', '.join(repr(t) for t in empty)} match no item "
+                   f"-- renamed or misspelled? They order nothing.")
+        logger.warning(message)
+        print(f"  ⚠️  {message}")
+        if results is not None:
+            results.setdefault('warnings', []).append(message)
+    if results is not None:
+        results['priority_tag_counts'] = dict(counts)
+    return counts
+
+
 def _index_priority_key(
     entry: dict,
     calibre_books: dict,
@@ -650,6 +687,7 @@ class WatchdogScanner:
         # since the last scan are reopened (see _annotation_changed).
         calibre_books = _calibre_metadata_for_hash(self.library_path)
         results['scanned'] = len(calibre_books)
+        report_priority_tags(first_tags, calibre_books, results)
 
         try:
             indexed_hashes = self._load_indexed_hashes()
@@ -1176,6 +1214,12 @@ class WatchdogScanner:
             f"  skipped_no_file: {len(results.get('skipped_no_file', []))}",
             "",
         ]
+        counts = results.get('priority_tag_counts')
+        if counts:
+            # In the log, not only on screen: the run that ordered by a renamed
+            # tag looked normal afterwards, and nothing recorded what it reached.
+            lines.insert(1, "  priority_tags: "
+                            + ", ".join(f"{tag} ({n})" for tag, n in counts.items()))
         self.archilles_dir.mkdir(parents=True, exist_ok=True)
         with open(self.log_file, 'a', encoding='utf-8') as fh:
             fh.write('\n'.join(lines) + '\n')
@@ -1459,6 +1503,7 @@ class ZoteroWatchdogScanner:
                 self._write_log(results)
             return results
         results['scanned'] = len(zotero_items)
+        report_priority_tags(first_tags, zotero_items, results)
 
         try:
             indexed_hashes = self._load_indexed_hashes()
@@ -1765,6 +1810,12 @@ class ZoteroWatchdogScanner:
             f"  skipped_no_file: {len(results.get('skipped_no_file', []))}",
             "",
         ]
+        counts = results.get('priority_tag_counts')
+        if counts:
+            # In the log, not only on screen: the run that ordered by a renamed
+            # tag looked normal afterwards, and nothing recorded what it reached.
+            lines.insert(1, "  priority_tags: "
+                            + ", ".join(f"{tag} ({n})" for tag, n in counts.items()))
         self.archilles_dir.mkdir(parents=True, exist_ok=True)
         with open(self.log_file, 'a', encoding='utf-8') as fh:
             fh.write('\n'.join(lines) + '\n')

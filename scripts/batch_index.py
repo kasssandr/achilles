@@ -982,6 +982,11 @@ def _adapter_list_books(
             return False
         docs = [d for d in docs if _author_matches(d)]
 
+    # A bundle lies in the library's extension zone under the adapter's own
+    # book_id, so Zotero keys and folder ids find theirs exactly as Calibre
+    # ids do (Naht S4).
+    archilles_dir = Path(adapter.library_path) / '.archilles'
+
     books = []
     for doc in docs:
         # Skip documents without a file
@@ -994,6 +999,7 @@ def _adapter_list_books(
         if not fmt:
             continue
 
+        bundle = bundle_master(archilles_dir, str(doc.doc_id))
         books.append({
             'id': doc.doc_id,
             'title': doc.title,
@@ -1001,6 +1007,7 @@ def _adapter_list_books(
             'path': str(doc.file_path.parent),
             'formats': [{'format': fmt, 'path': str(doc.file_path)}],
             'best_format': {'format': fmt, 'path': str(doc.file_path)},
+            'bundle': str(bundle) if bundle else None,
         })
 
     return books

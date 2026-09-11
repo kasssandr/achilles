@@ -232,3 +232,50 @@ def test_quality_selection_does_not_compare_formats_of_a_book_with_a_bundle(tmp_
     batch_index([_book_entry(library)], rag=rag, quality_select=True)
     assert compared == []
     assert indexed == [str(book_dir / "book.pdf")]
+
+
+# every source, not only Calibre --------------------------------------------------
+
+def _zotero_adapter(library, doc_id="ABCD1234"):
+    """A minimal SourceAdapter over one PDF, as ZoteroAdapter reports one."""
+    storage = library / "storage" / doc_id
+    storage.mkdir(parents=True, exist_ok=True)
+    pdf = storage / "Aufsatz.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    doc = SimpleNamespace(doc_id=doc_id, title="Aufsatz", authors=["Bauer"],
+                          file_path=pdf, file_format="pdf", tags=[])
+    return SimpleNamespace(adapter_type="zotero", library_path=library,
+                           list_documents=lambda **kw: [doc]), pdf
+
+
+def test_a_zotero_item_names_its_bundle_like_a_calibre_book(tmp_path):
+    from scripts.batch_index import _adapter_list_books
+    adapter, _ = _zotero_adapter(tmp_path)
+    master = _bundle(tmp_path, key="ABCD1234")
+    assert _adapter_list_books(adapter)[0]["bundle"] == str(master)
+
+
+def test_a_zotero_item_without_a_bundle_says_so(tmp_path):
+    from scripts.batch_index import _adapter_list_books
+    adapter, _ = _zotero_adapter(tmp_path)
+    assert _adapter_list_books(adapter)[0]["bundle"] is None
+
+
+def test_dry_run_shows_a_zotero_bundle_as_the_format(tmp_path, capsys):
+    from scripts.batch_index import _adapter_list_books, batch_index
+    adapter, pdf = _zotero_adapter(tmp_path)
+    _bundle(tmp_path, key="ABCD1234")
+    batch_index(_adapter_list_books(adapter), rag=None, dry_run=True)
+    out = capsys.readouterr().out
+    assert "Format: SCRIPTOR" in out
+    assert str(pdf) in out                       # still handed the attachment
+
+
+def test_index_book_finds_a_bundle_through_the_adapters_library(tmp_path):
+    """_text_source asks the adapter where the library is; only a Calibre book
+    without one falls back to searching for metadata.db."""
+    adapter, pdf = _zotero_adapter(tmp_path)
+    master = _bundle(tmp_path, key="ABCD1234")
+    indexer = _indexer(extracted_from=[], metadata_from=[])
+    indexer._rag._adapter = adapter
+    assert indexer._text_source(pdf, "ABCD1234") == master

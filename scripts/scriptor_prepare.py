@@ -304,11 +304,21 @@ def write_report(scriptor_dir: Path, state: dict[str, dict], run: dict[str, Any]
     built = [(bid, e) for bid, e in sorted(state.items()) if e.get("admitted")]
     if built:
         total_decisions = sum(e.get("decisions") or 0 for _bid, e in built)
+        attested = sorted(
+            e["checks"]["attested"] for _b, e in built
+            if (e.get("checks") or {}).get("attested") is not None
+        )
+        spread = ""
+        if attested:
+            middle = attested[len(attested) // 2]
+            spread = (f" Bezeugte Seiten: Median {middle:.0%}, "
+                      f"von {attested[0]:.0%} bis {attested[-1]:.0%}.")
         lines += [
             "## Bündel im Bestand",
             "",
             f"Offene Entscheidungen insgesamt: **{total_decisions}** "
-            f"in {sum(1 for _b, e in built if e.get('decisions'))} von {len(built)} Bänden.",
+            f"in {sum(1 for _b, e in built if e.get('decisions'))} von {len(built)} Bänden."
+            + spread,
             "",
             "| Band | Titel | Deckung | Noten | bezeugt | geerbt | Entsch. | Stand |",
             "|---|---|---:|---:|---:|---:|---:|---|",

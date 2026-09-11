@@ -631,3 +631,14 @@ def test_a_volume_that_passes_leaves_no_refused_copy_behind(tmp_path, monkeypatc
     assert check.admitted and master is not None
     assert not (scriptor_dir / sp.REJECTED_FOLDER).exists()
     assert not (scriptor_dir / sp.WORK_FOLDER).exists()
+
+
+def test_the_report_gives_the_spread_of_attested_pages(tmp_path):
+    state = {
+        str(i): {"title": f"Band {i}", "admitted": True, "decisions": 0,
+                 "checks": {"coverage": 1.0, "attested": a, "inherited": 0.0,
+                            "definitions": 0, "certain_notes": 0}}
+        for i, a in enumerate([0.31, 0.62, 0.99])
+    }
+    text = sp.write_report(tmp_path, state, {"total": 3}).read_text(encoding="utf-8")
+    assert "Median 62%, von 31% bis 99%" in text

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from scriptor.document import SIDECAR_VERSION
 
 from src.archilles.scriptor_build import (
     MAX_INHERITED,
@@ -72,7 +73,8 @@ def _bundle(folder: Path, body: str, *, attested=0.9, inherited=0.01,
         if inherited is not None:
             profile["inherited"] = inherited
         (folder / "book.md.pagination.json").write_text(
-            json.dumps({"version": "0.2", "profile": profile, "pages": []}), encoding="utf-8")
+            json.dumps({"version": SIDECAR_VERSION, "profile": profile, "pages": []}),
+            encoding="utf-8")
     if decisions:
         (folder / "book.md.decisions.txt").write_text(
             "# header\n" + "\n".join(f"p.{i} unklar" for i in range(decisions)), encoding="utf-8")
@@ -520,3 +522,95 @@ def test_the_run_writes_the_report(tmp_path, monkeypatch):
     report = (tmp_path / ".archilles" / "scriptor" / sp.REPORT_FILE).read_text(encoding="utf-8")
     assert "Die Aneignung von Bildern" in report
     assert sp.STATE_RELEASED in report
+
+
+# ── what the coverage question does not apply to ─────────────────────────────
+
+PAGE_C = ("Der dritte Abschnitt fragt nach dem Freiraum, den ein Zitatrecht lassen "
+          "muss, damit die Kunst der Aneignung überhaupt möglich bleibt, und nach der "
+          "Frage, wer diesen Freiraum eigentlich verteidigt, wenn die Verwerter ihn "
+          "nicht brauchen und die Urheber ihn fürchten, obwohl sie selbst von ihm "
+          "leben, sooft sie ein fremdes Bild in die eigene Arbeit holen.")
+
+TOC_PAGE = ("Inhaltsverzeichnis Einleitung 19 Aneignung als Rechtsbegriff 24 "
+            "Aneignung als kultureller Begriff 27 Begriffsbestimmung für die Zwecke "
+            "dieser Arbeit 32 Begriff des Bildlichen 42 Fazit 58 Zweites Kapitel 61 "
+            "Vervielfältigungsrecht 142 Zwischenfazit 178 Strategien 222 Register 340")
+
+CONTENTS_HEAD = ("[region: front-matter]\n\n[region: contents]\n\n## Contents\n\n"
+                 "- [Einleitung](#p-19) — p. 19\n- [Fazit](#p-58) — p. 58\n\n"
+                 "[region: main]\n\n")
+
+
+def _paged_bundle(folder: Path, body: str, positions: list[int]) -> Path:
+    """A bundle whose sidecar knows ``positions`` as labelled pages."""
+    folder.mkdir(parents=True, exist_ok=True)
+    master = folder / "book.md"
+    master.write_text(_master(body), encoding="utf-8")
+    (folder / "book.md.audit.txt").write_text(
+        "# 4 pages, 0 certain footnotes, 0 uncertain, 0 with several candidates.\n",
+        encoding="utf-8")
+    (folder / "book.md.pagination.json").write_text(json.dumps({
+        "version": SIDECAR_VERSION,
+        "profile": {"edge": "bottom", "attested": 0.9, "inherited": 0.0,
+                    "description": "bottom"},
+        "pages": [{"pos": p, "label": str(p), "source": "printed", "confidence": 1.0}
+                  for p in positions],
+    }), encoding="utf-8")
+    return master
+
+
+def test_a_rebuilt_table_of_contents_is_not_counted_as_lost_text(tmp_path):
+    """Scriptor replaces the printed contents with a link list on purpose, so
+    that page leaves no marker and its text is nowhere in the master."""
+    from src.archilles.scriptor_build import front_matter_pages
+
+    pdf = _pdf(tmp_path / "book.pdf", [TOC_PAGE, PAGE_A, PAGE_B, PAGE_C])
+    master = _paged_bundle(
+        tmp_path / "b",
+        CONTENTS_HEAD + f"[p. 2] {PAGE_A}\n\n[p. 3] {PAGE_B}\n\n[p. 4] {PAGE_C}",
+        [1, 2, 3, 4])
+
+    assert front_matter_pages(master) == {1}
+    check = check_bundle(master, pdf)
+    assert check.admitted, check.reasons
+    assert check.coverage == 1.0
+
+
+def test_a_body_page_that_left_no_marker_is_still_lost(tmp_path):
+    """The same shape as a rebuilt contents -- no marker, no text -- but the
+    stretch it falls in opens no front-matter region."""
+    from src.archilles.scriptor_build import front_matter_pages
+
+    pdf = _pdf(tmp_path / "book.pdf", [TOC_PAGE, PAGE_A, PAGE_B, PAGE_C])
+    master = _paged_bundle(
+        tmp_path / "b",
+        CONTENTS_HEAD + f"[p. 2] {PAGE_A}\n\n[p. 4] {PAGE_C}",
+        [1, 2, 3, 4])
+
+    assert front_matter_pages(master) == {1}
+    check = check_bundle(master, pdf)
+    assert not check.admitted
+    assert check.lost_pages == [3]
+
+
+def test_a_footnote_renumbered_document_wide_does_not_break_its_page(tmp_path):
+    """The printed superscript is page-local (182), the master's anchor is
+    document-wide ([^185]); digits are dropped on both sides so the sentence
+    still matches."""
+    printed = PAGE_A.replace("Frage,", "Frage,182")
+    pdf = _pdf(tmp_path / "book.pdf", [printed])
+    share, lost = text_coverage(
+        pdf, _master(PAGE_A.replace("Frage,", "Frage, [^185]") + "\n\n[^185]: Dazu unten."))
+    assert (share, lost) == (1.0, [])
+
+
+def test_a_volume_with_nothing_left_to_check_is_unknown_not_empty(tmp_path):
+    pdf = _pdf(tmp_path / "book.pdf", [PAGE_A, PAGE_B])
+    share, _lost = text_coverage(pdf, _master(PAGE_A), skip_pages={1, 2})
+    assert share is None
+
+    master = _bundle(tmp_path / "b", PAGE_A)
+    check = check_bundle(master, pdf)
+    check.coverage = None
+    assert "no page could be checked" not in "".join(check.reasons)   # measured above

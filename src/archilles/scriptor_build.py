@@ -45,17 +45,17 @@ _WINDOW_WORDS = 8
 # Below this a normalised window is too short to be a distinctive fingerprint.
 _MIN_WINDOW_CHARS = 25
 
-_NON_WORD = re.compile(r"[^0-9a-zà-öø-ÿ]+", re.IGNORECASE)
+# Letters only. Digits are dropped on both sides: a footnote's number is
+# page-local in print and document-wide in the master ("...2016.182 Morris"
+# against "...2016.[^185] Morris"), so no window straddling an anchor could
+# ever match while digits counted -- and nothing else in a window of eight
+# words needs them to be distinctive.
+_NON_WORD = re.compile(r"[^a-zà-öø-ÿ]+", re.IGNORECASE)
 _DEFINITION = re.compile(r"^\[\^[^\]]+\]:", re.MULTILINE)
 _AUDIT_CERTAIN = re.compile(r"(\d+) certain footnotes")
-# Spec markup that stands for nothing on the page: page markers, their anchors,
-# region marks. They normalise to digits in the middle of a sentence, so a
-# window straddling one would never be found although its words are all there.
-_SPEC_MARKUP = re.compile(r"\[p\.[^\]]*\]|\{#p-[^}]*\}|\[region:[^\]]*\]")
-# A footnote anchor and its definition head stand for a number that IS on the
-# page -- the superscript. Reduced to that number they match the PDF's text
-# layer, where the superscript sits against the word ("fois.1 Autre exemple").
-_FOOTNOTE_MARK = re.compile(r"\[\^([^\]]+)\]:?")
+# Everything the spec writes into the text that is not the text: page markers
+# and their anchors, region marks, footnote anchors and definition heads.
+_SPEC_MARKUP = re.compile(r"\[p\.[^\]]*\]|\{#p-[^}]*\}|\[region:[^\]]*\]|\[\^[^\]]+\]:?")
 
 
 def _normalise(text: str) -> str:
@@ -69,14 +69,68 @@ def _normalise(text: str) -> str:
 
 
 def _haystack(master_text: str) -> str:
-    """The master as the page's own text: markup removed, footnote marks kept
-    as the numbers they replaced."""
+    """The master as pure text: metadata block and spec markup removed."""
     from scriptor.reflow.regions import strip_metadata_block
 
-    text = strip_metadata_block(master_text)
-    text = _SPEC_MARKUP.sub(" ", text)
-    text = _FOOTNOTE_MARK.sub(r"", text)
-    return _normalise(text)
+    return _normalise(_SPEC_MARKUP.sub(" ", strip_metadata_block(master_text)))
+
+
+def front_matter_pages(master: Path) -> set[int]:
+    """Physical pages the master declares to be front matter.
+
+    Two ways a page gets in. Its own page marker may stand in a front-matter
+    region. Or it may have no marker at all while the stretch it falls in --
+    between the markers of the pages around it -- opens one: the table of
+    contents is rebuilt as a link list and the list of figures is reordered,
+    both on purpose (spec §4.4), so those pages leave no marker behind and
+    their printed text is not in the master and never was meant to be. They
+    also leave the default search, so the coverage question does not apply to
+    them.
+
+    A page lost by accident leaves no marker either, but the stretch it falls
+    in opens no front-matter region -- which is what keeps this from excusing
+    a real loss. An unreadable bundle excludes nothing.
+    """
+    from scriptor.document import load_bundle, parse_prepared, region_at
+
+    from src.archilles.constants import SectionType
+    from src.extractors.scriptor_extractor import region_to_section_type
+
+    def is_front(region: str) -> bool:
+        return region_to_section_type(region) == SectionType.FRONT_MATTER
+
+    try:
+        bundle = load_bundle(master)
+    except Exception as exc:
+        # Loud, not silent: without the bundle every page is judged, and a
+        # volume whose contents were rebuilt then reads as losing them.
+        logger.warning("%s: bundle not readable (%s) -- no page exempted", master, exc)
+        return set()
+    if bundle is None:
+        logger.warning("%s: no metadata block -- no page exempted", master)
+        return set()
+
+    doc = parse_prepared(bundle.text)
+    marks = [
+        (offset, entry.pos)
+        for (_label, offset), entry in zip(doc.page_marks, bundle.resolve_marks(doc))
+        if entry is not None
+    ]
+
+    out: set[int] = set()
+    previous_offset, previous_pos = 0, 0
+    for offset, pos in marks:
+        if is_front(region_at(doc, offset)):
+            out.add(pos)
+        if pos > previous_pos + 1:
+            opens_front = is_front(region_at(doc, previous_offset)) or any(
+                is_front(name) for name, mark in doc.region_marks
+                if previous_offset <= mark <= offset
+            )
+            if opens_front:
+                out.update(range(previous_pos + 1, pos))
+        previous_offset, previous_pos = offset, pos
+    return out
 
 
 def _windows(words: list[str]) -> list[str]:
@@ -88,7 +142,9 @@ def _windows(words: list[str]) -> list[str]:
     return [w for w in out if len(w) >= _MIN_WINDOW_CHARS]
 
 
-def text_coverage(pdf_path: Path, master_text: str) -> tuple[float, list[int]]:
+def text_coverage(
+    pdf_path: Path, master_text: str, skip_pages: set[int] | None = None
+) -> tuple[float | None, list[int]]:
     """Share of the PDF's pages whose text is in the master, and the lost ones.
 
     The page is the unit, the windows are how a page is judged: it counts as
@@ -98,14 +154,22 @@ def text_coverage(pdf_path: Path, master_text: str) -> tuple[float, list[int]]:
     holds its running head and the one that holds its foot, both of which
     Scriptor removes on purpose, and a volume in perfect shape then reads
     92 to 96 %.
+
+    ``skip_pages`` names physical pages the question does not apply to (see
+    :func:`front_matter_pages`). Where that leaves no page to check -- a short
+    extract that is front matter all through -- the share is ``None``: unknown,
+    which is not the same as nothing found.
     """
     import pymupdf
 
+    skip = skip_pages or set()
     haystack = _haystack(master_text)
     checked = present = 0
     lost: list[int] = []
     with pymupdf.open(pdf_path) as doc:
         for number, page in enumerate(doc, 1):
+            if number in skip:
+                continue
             words = page.get_text().split()
             if len(words) < _MIN_PAGE_WORDS:
                 continue
@@ -118,7 +182,7 @@ def text_coverage(pdf_path: Path, master_text: str) -> tuple[float, list[int]]:
             else:
                 lost.append(number)
     if not checked:
-        return 0.0, lost
+        return None, lost
     return present / checked, lost
 
 
@@ -180,11 +244,14 @@ def check_bundle(master: Path, pdf_path: Path) -> BundleCheck:
 
     # 1 -- text coverage
     try:
-        check.coverage, check.lost_pages = text_coverage(pdf_path, master_text)
+        check.coverage, check.lost_pages = text_coverage(
+            pdf_path, master_text, front_matter_pages(master))
     except Exception as exc:
         check.error = f"coverage not measurable: {type(exc).__name__}: {exc}"
         return check
-    if check.coverage < MIN_COVERAGE:
+    if check.coverage is None:
+        check.reasons.append("no page could be checked for text coverage")
+    elif check.coverage < MIN_COVERAGE:
         check.reasons.append(
             f"text coverage {check.coverage:.1%} < {MIN_COVERAGE:.0%}"
             + (f" ({len(check.lost_pages)} pages lost)" if check.lost_pages else "")

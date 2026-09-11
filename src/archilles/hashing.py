@@ -68,3 +68,23 @@ def compute_annotation_hash(annotations: List[Dict[str, Any]]) -> str:
         for a in annotations
     )
     return hashlib.md5('\n'.join(texts).encode('utf-8')).hexdigest()
+
+
+def file_sha256(path) -> str | None:
+    """SHA-256 of a file's bytes, or ``None`` if it cannot be read.
+
+    Used to tell a file's versions apart -- a Scriptor master as the tool wrote
+    it, the same master after handwork, the version that reached the index.
+    Unlike the hashes above this one has no corpus-wide invariant: it is
+    compared only against another reading of the same file.
+    """
+    from pathlib import Path
+
+    digest = hashlib.sha256()
+    try:
+        with open(Path(path), "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()

@@ -82,6 +82,7 @@ _KNOWN_LIBRARY_CONFIG_KEYS: frozenset[str] = frozenset({
     "name",
     "rag_db_path",
     "reranker_device",
+    "scriptor",
 })
 
 # Near-misses worth naming outright rather than leaving to the reader.
@@ -290,6 +291,33 @@ def get_mode(library_path: Path | None = None) -> str:
     if isinstance(val, str) and val in VALID_MODES:
         return val
     return DEFAULT_MODE
+
+
+# How a library wants its volumes prepared by Scriptor. ``chunking`` is the
+# strategy handed to ``scriptor.pipeline.run_all``; ``scientific`` keeps the
+# footnote apparatus with the paragraph that carries the anchor, ``basic``
+# drops the definitions.
+_SCRIPTOR_DEFAULTS = {
+    "chunking": "scientific",
+}
+
+
+def get_scriptor_config(library_path: Path | None = None) -> dict:
+    """The library's ``scriptor`` block, filled up with the defaults.
+
+    Lenient like :func:`get_mode`: a missing config, a non-dict value or an
+    unknown key never crashes a prepare run -- unknown keys are reported by
+    the config reader, and values that are not strings fall back.
+    """
+    settings = dict(_SCRIPTOR_DEFAULTS)
+    if library_path is None:
+        return settings
+    block = _read_library_config(library_path).get("scriptor")
+    if isinstance(block, dict):
+        for key, value in block.items():
+            if key in settings and isinstance(value, type(settings[key])):
+                settings[key] = value
+    return settings
 
 
 # Built-in defaults for the embed-prepared embedder; mirror the argparse

@@ -40,8 +40,12 @@ History
 ``1``    First marked generation. Comment-chunk composition unified in
          ``comment_chunks`` (finding 1.8); ``strip_html`` no longer splits
          words at inline markup (finding 1.12).
+``2``    EPUB ``chapter`` takes the table-of-contents title of a file that
+         has no ``<h1>``, instead of its file name (Gliederung B1). The
+         embedded text is unchanged; the stored field is not, and the marker
+         is how rows with a file name as chapter stay findable.
 """
 
 from __future__ import annotations
 
-PIPELINE_VERSION = "1"
+PIPELINE_VERSION = "2"

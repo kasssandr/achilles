@@ -196,7 +196,7 @@ class EPUBExtractor(BaseExtractor):
 
                 chapters_text.append(section['text'])
                 chapters_metadata.append({
-                    'chapter': chapter_title or item_name,
+                    'chapter': display_title or item_name,
                     'section': toc_info.get('section'),
                     'section_title': section_title,
                     'section_type': chapter_section_type,

@@ -203,11 +203,11 @@ class PromptBuilder:
 
         Args:
             citation_config: Optional CitationConfig instance. When provided,
-                rule 5 includes the user's preferred bibliography style.
+                rule 6 includes the user's preferred bibliography style.
 
         Returns XML-formatted instructions that tell Claude to cite sources.
         """
-        # Build bibliography instruction (rule 5)
+        # Build bibliography instruction (rule 6)
         if citation_config is not None:
             from src.citation.config import format_bibliography_instruction
             bib_instruction = (
@@ -225,7 +225,8 @@ You are an academic research assistant. Your task is to answer the user's questi
 2. Do not use external information. If the answer is not in the documents, say so clearly.
 3. Answer in the user's language, but keep the scholarly terminology.
 4. For multiple sources supporting the same statement, give all relevant IDs, e.g. [doc_1, doc_3].
-5. {bib_instruction}
+5. A page marked "(inferred)" was not read off the page itself; it follows from the numbering. Cite it, but say in the same breath that the page is inferred, so the reader can verify it against the volume.
+6. {bib_instruction}
 </rules>
 </system_instructions>"""
 
@@ -284,9 +285,9 @@ You are an academic research assistant. Your task is to answer the user's questi
             if section_meta:
                 meta_parts.append(section_meta)
 
-            page_val, _, _ = self._rag._resolve_page_info(metadata)
-            if page_val:
-                meta_parts.append(f"Page: {page_val}")
+            page_part = self._page_meta_part(metadata)
+            if page_part:
+                meta_parts.append(page_part)
 
             meta_str = " | ".join(meta_parts) if meta_parts else "Metadata not available"
 
@@ -359,6 +360,18 @@ You are an academic research assistant. Your task is to answer the user's questi
         # Graceful degradation: return original chunk
         return chunk_text
 
+    def _page_meta_part(self, metadata: Dict[str, Any]) -> str:
+        """The ``Page: …`` part of a prompt's metadata line, or ``''``.
+
+        A label that only follows from the numbering is marked ``(inferred)``
+        so the answering model can pass that on: the reader is told which
+        citations to verify against the volume (spec §6.3, Naht S5).
+        """
+        page_val, _, warning = self._rag._resolve_page_info(metadata)
+        if not page_val:
+            return ''
+        return f"Page: {page_val} (inferred)" if warning else f"Page: {page_val}"
+
     def _build_inline_metadata(self, metadata: Dict[str, Any], doc_id: str) -> str:
         """
         Build inline metadata string to inject before chunk text.
@@ -382,9 +395,9 @@ You are an academic research assistant. Your task is to answer the user's questi
         if section_meta:
             meta_parts.append(section_meta)
 
-        page_val, _, _ = self._rag._resolve_page_info(metadata)
-        if page_val:
-            meta_parts.append(f"Page: {page_val}")
+        page_part = self._page_meta_part(metadata)
+        if page_part:
+            meta_parts.append(page_part)
 
         if metadata.get('language'):
             meta_parts.append(f"Language: {metadata['language']}")

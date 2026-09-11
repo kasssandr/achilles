@@ -110,3 +110,47 @@ def test_the_calibre_link_opens_the_physical_page(tmp_path):
                              "page_label": "88", "page_number": 104}}]
     out = rag.export_to_markdown(results, "Satz", str(tmp_path / "export.md"))
     assert "calibre://view/10593#page=104" in Path(out).read_text(encoding="utf-8")
+
+
+# the prompt Claude gets -----------------------------------------------------------
+
+def _prompt_builder():
+    from src.archilles.engine.prompting import PromptBuilder
+    rag = SimpleNamespace(
+        _resolve_page_info=ArchillesRAG._resolve_page_info,
+        _format_section_meta=lambda meta: '',
+    )
+    return PromptBuilder(rag)
+
+
+@pytest.mark.parametrize("label_source, expected", [
+    ("printed", "Page: 88"),
+    ("toc", "Page: 88"),
+    ("computed", "Page: 88 (inferred)"),
+    ("ocr-verified", "Page: 88 (inferred)"),
+    ("", "Page: 88"),
+])
+def test_an_inferred_label_reaches_the_answering_model_as_such(label_source, expected):
+    meta = {"page_label": "88", "page_number": 104, "label_source": label_source}
+    builder = _prompt_builder()
+
+    assert builder._page_meta_part(meta) == expected
+    assert expected in builder._build_inline_metadata(meta, "doc_1")
+
+
+def test_the_physical_page_is_never_marked_inferred():
+    assert _prompt_builder()._page_meta_part({"page_number": 104}) == "Page: 104"
+
+
+def test_a_document_block_carries_the_mark_too():
+    rows = [{"rank": 1, "similarity": 0.8, "text": "Ein Satz.",
+             "metadata": {"page_label": "88", "label_source": "computed"}}]
+    xml = _prompt_builder().format_results_as_xml(rows, "Satz")
+    assert "Page: 88 (inferred)" in xml
+
+
+def test_the_system_prompt_tells_claude_what_the_mark_means():
+    from src.archilles.engine.prompting import PromptBuilder
+    prompt = PromptBuilder.get_system_prompt()
+    assert "(inferred)" in prompt
+    assert "verify" in prompt

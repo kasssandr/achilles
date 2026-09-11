@@ -252,7 +252,7 @@ def test_a_passing_run_lands_where_indexing_looks(tmp_path, monkeypatch):
     _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}", decisions=3))
 
     master, check, timings = sp.prepare_volume(
-        {"id": "10593"}, pdf, scriptor_dir, chunking="scientific", keep_pages=False)
+        "10593", pdf, scriptor_dir, chunking="scientific", keep_pages=False)
 
     assert check.admitted and master is not None
     assert master == bundle_master(tmp_path / ".archilles", "10593")
@@ -269,7 +269,7 @@ def test_a_refused_run_leaves_no_bundle_and_keeps_its_evidence(tmp_path, monkeyp
     _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}", attested=0.9))
 
     master, check, _t = sp.prepare_volume(
-        {"id": "10593"}, pdf, scriptor_dir, chunking="scientific", keep_pages=False)
+        "10593", pdf, scriptor_dir, chunking="scientific", keep_pages=False)
 
     assert master is None and not check.admitted
     assert bundle_master(tmp_path / ".archilles", "10593") is None
@@ -290,7 +290,7 @@ def test_a_failed_scriptor_run_does_not_touch_the_bundle_in_place(tmp_path, monk
 
     _install(monkeypatch, boom)
     master, check, _t = sp.prepare_volume(
-        {"id": "10593"}, pdf, scriptor_dir, chunking="scientific", keep_pages=False)
+        "10593", pdf, scriptor_dir, chunking="scientific", keep_pages=False)
 
     assert master is None and "Scriptor exploded" in check.error
     assert bundle_master(tmp_path / ".archilles", "10593") == good
@@ -305,7 +305,7 @@ def test_force_replaces_the_bundle_that_is_there(tmp_path, monkeypatch):
     _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}"))
 
     master, check, _t = sp.prepare_volume(
-        {"id": "10593"}, pdf, scriptor_dir, chunking="scientific", keep_pages=False)
+        "10593", pdf, scriptor_dir, chunking="scientific", keep_pages=False)
 
     assert check.admitted
     assert PAGE_A[:30] in master.read_text(encoding="utf-8")
@@ -318,7 +318,7 @@ def test_keep_pages_keeps_the_page_models(tmp_path, monkeypatch):
     _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}"))
 
     master, _c, _t = sp.prepare_volume(
-        {"id": "10593"}, pdf, scriptor_dir, chunking="scientific", keep_pages=True)
+        "10593", pdf, scriptor_dir, chunking="scientific", keep_pages=True)
     assert (master.parent / "pages" / "0001.json").exists()
 
 
@@ -621,12 +621,12 @@ def test_a_volume_that_passes_leaves_no_refused_copy_behind(tmp_path, monkeypatc
     scriptor_dir = tmp_path / ".archilles" / "scriptor"
 
     _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}"))            # refused
-    sp.prepare_volume({"id": "10593"}, pdf, scriptor_dir,
+    sp.prepare_volume("10593", pdf, scriptor_dir,
                       chunking="scientific", keep_pages=False)
     assert (scriptor_dir / sp.REJECTED_FOLDER / "10593").exists()
 
     _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}"))
-    master, check, _t = sp.prepare_volume({"id": "10593"}, pdf, scriptor_dir,
+    master, check, _t = sp.prepare_volume("10593", pdf, scriptor_dir,
                                           chunking="scientific", keep_pages=False)
     assert check.admitted and master is not None
     assert not (scriptor_dir / sp.REJECTED_FOLDER).exists()
@@ -642,3 +642,76 @@ def test_the_report_gives_the_spread_of_attested_pages(tmp_path):
     }
     text = sp.write_report(tmp_path, state, {"total": 3}).read_text(encoding="utf-8")
     assert "Median 62%, von 31% bis 99%" in text
+
+
+def test_a_volume_whose_indexing_failed_is_not_marked_done(tmp_path, monkeypatch):
+    """The bundle stands, the index is behind -- a resumed run must come back
+    to it instead of skipping it."""
+    from src.archilles.indexer.checkpoint import IndexingCheckpoint
+
+    book, _pdf_path = _book(tmp_path)
+    monkeypatch.setattr(sp, "get_library_path", lambda: tmp_path)
+    monkeypatch.setattr(sp, "_select_books", lambda args, lib, adapter: [book])
+
+    def explode(path, book_id, force):
+        raise RuntimeError("GPU busy")
+
+    monkeypatch.setattr(sp, "_load_rag",
+                        lambda lib, adapter: SimpleNamespace(index_book=explode))
+    _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}"))
+
+    # The checkpoint is deleted when the pass ends; catch what it recorded.
+    failed: dict[str, str] = {}
+    monkeypatch.setattr(IndexingCheckpoint, "fail_book",
+                        lambda self, book_id, error: failed.__setitem__(book_id, error))
+
+    sp.run(_args())
+
+    state = json.loads(
+        (tmp_path / ".archilles" / "scriptor" / sp.STATE_FILE).read_text(encoding="utf-8"))
+    assert state["10593"]["admitted"] is True
+    assert state["10593"]["indexed_hash"] is None
+    assert failed == {"10593": "GPU busy"}
+
+
+def test_a_report_only_rewrite_describes_no_run(tmp_path):
+    state = {"10593": {"title": "Bauer", "admitted": True, "checks": {}}}
+    text = sp.write_report(tmp_path, state, {"total": 0}).read_text(encoding="utf-8")
+    assert "## Dieser Lauf" not in text
+    assert "Bauer" in text
+
+
+def test_a_later_run_brings_the_index_up_to_a_bundle_built_without_it(tmp_path, monkeypatch):
+    book, pdf = _book(tmp_path)
+    indexed, runs = [], []
+    _wire(tmp_path, monkeypatch, [book], indexed)
+
+    def counting_run_all(*a, **kw):
+        runs.append(1)
+        return _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}")(*a, **kw)
+
+    _install(monkeypatch, counting_run_all)
+
+    sp.run(_args(index=False))
+    assert indexed == [] and len(runs) == 1
+
+    sp.run(_args())
+    assert indexed == [(str(pdf), "10593", True)]
+    assert len(runs) == 1                      # Scriptor did not run a second time
+
+
+def test_handwork_on_the_master_reaches_the_index_on_the_next_run(tmp_path, monkeypatch):
+    book, pdf = _book(tmp_path)
+    indexed = []
+    _wire(tmp_path, monkeypatch, [book], indexed)
+    _install(monkeypatch, _fake_run_all(f"[p. 87] {PAGE_A}\n\n[p. 88] {PAGE_B}"))
+
+    sp.run(_args())
+    master = tmp_path / ".archilles" / "scriptor" / "10593" / "book.md"
+    master.write_text(master.read_text(encoding="utf-8") + "\n\nVon Hand ergänzt.\n",
+                      encoding="utf-8")
+
+    sp.run(_args())
+    assert len(indexed) == 2
+    report = (tmp_path / ".archilles" / "scriptor" / sp.REPORT_FILE).read_text(encoding="utf-8")
+    assert sp.STATE_RELEASED in report

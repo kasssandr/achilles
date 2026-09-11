@@ -196,7 +196,7 @@ def _move_bundle(work: Path, target: Path, keep_pages: bool) -> None:
 
 
 def prepare_volume(
-    book: dict[str, Any],
+    book_id: str,
     pdf: Path,
     scriptor_dir: Path,
     *,
@@ -211,7 +211,7 @@ def prepare_volume(
     """
     from src.archilles.scriptor_build import BundleCheck
 
-    key = prepared_jsonl_name(str(book["id"]))[: -len(".jsonl")]
+    key = prepared_jsonl_name(str(book_id))[: -len(".jsonl")]
     work = scriptor_dir / WORK_FOLDER / key
     target = scriptor_dir / key
     rejected = scriptor_dir / REJECTED_FOLDER / key
@@ -289,17 +289,21 @@ def write_report(scriptor_dir: Path, state: dict[str, dict], run: dict[str, Any]
         "bezeugter Seiten, und der Anteil Text, der unter der Nummer einer anderen",
         "Seite steht. Wer eine verfehlt, bekommt kein Bündel.",
         "",
-        "## Dieser Lauf",
-        "",
-        f"- Bände betrachtet: {run.get('total', 0)}",
-        f"- Bündel gebaut: {run.get('built', 0)}",
-        f"- übersprungen (Bündel vorhanden): {run.get('skipped', 0)}",
-        f"- ohne PDF (Scriptor liest keine EPUBs): {run.get('no_pdf', 0)}",
-        f"- nicht zugelassen: {run.get('rejected', 0)}",
-        f"- gescheitert: {run.get('failed', 0)}",
-        f"- indexiert: {run.get('indexed', 0)}",
-        "",
     ]
+    if run.get("total"):
+        lines += [
+            "## Dieser Lauf",
+            "",
+            f"- Bände betrachtet: {run['total']}",
+            f"- Bündel gebaut: {run.get('built', 0)}",
+            f"- übersprungen (Bündel vorhanden): {run.get('skipped', 0)}",
+            f"- ohne PDF (Scriptor liest keine EPUBs): {run.get('no_pdf', 0)}",
+            f"- nicht zugelassen: {run.get('rejected', 0)}",
+            f"- gescheitert: {run.get('failed', 0)}",
+            f"- indexiert: {run.get('indexed', 0)}",
+            f"- Indexierung gescheitert: {run.get('index_failed', 0)}",
+            "",
+        ]
 
     built = [(bid, e) for bid, e in sorted(state.items()) if e.get("admitted")]
     if built:
@@ -433,7 +437,7 @@ def run(args) -> int:
 
     stats: dict[str, Any] = {
         "total": len(books), "built": 0, "skipped": 0, "no_pdf": 0,
-        "rejected": 0, "failed": 0, "indexed": 0,
+        "rejected": 0, "failed": 0, "indexed": 0, "index_failed": 0,
     }
     queued: list[str] = []
 
@@ -465,53 +469,74 @@ def run(args) -> int:
 
         existing = bundle_master(archilles_dir, book_id)
         if existing and not args.force:
-            entry = state.get(book_id, {})
-            print(f"         Bundle exists ({volume_state(entry, existing)}). "
-                  f"Skipping — use --force to rebuild.")
-            stats["skipped"] += 1
-            continue
+            status = volume_state(state.get(book_id) or {}, existing)
+            if args.dry_run:
+                print(f"         Bundle exists ({status}). Would skip.")
+                continue
+            if not args.index or status == STATE_RELEASED:
+                print(f"         Bundle exists ({status}). "
+                      f"Skipping — use --force to rebuild.")
+                stats["skipped"] += 1
+                continue
+            # Built by an earlier --no-index run, or edited by hand since: the
+            # bundle stands, only the index is behind it.
+            print(f"         Bundle exists ({status}) — bringing the index up to it.")
+            master = existing
+            entry = dict(state.get(book_id) or {})
+            entry.update({
+                "title": book.get("title", ""),
+                "author": book.get("author", ""),
+                "source_pdf": str(pdf),
+                "master": str(master),
+                "built_hash": file_sha256(master),
+                "admitted": True,
+            })
+            entry.setdefault("checks", {})
+            entry.setdefault("decisions", open_decisions(master))
+        else:
+            if args.dry_run:
+                print(f"         Would prepare: {pdf}")
+                print(f"         Bundle would go to: {bundle_dir(archilles_dir, book_id)}")
+                continue
 
-        if args.dry_run:
-            print(f"         Would prepare: {pdf}")
-            print(f"         Bundle would go to: {bundle_dir(archilles_dir, book_id)}")
-            continue
+            master, check, timings = prepare_volume(
+                book_id, Path(pdf), scriptor_dir,
+                chunking=chunking, keep_pages=args.keep_pages,
+            )
 
-        master, check, timings = prepare_volume(
-            book, Path(pdf), scriptor_dir,
-            chunking=chunking, keep_pages=args.keep_pages,
-        )
+            entry = {
+                "title": book.get("title", ""),
+                "author": book.get("author", ""),
+                "source_pdf": str(pdf),
+                "built_at": datetime.now().isoformat(timespec="seconds"),
+                "seconds": timings.get("seconds"),
+                "decisions": timings.get("decisions", 0),
+                "admitted": master is not None,
+                "checks": check.as_dict(),
+                "master": str(master) if master else None,
+                "built_hash": file_sha256(master) if master else None,
+                "indexed_hash": None,
+                "indexed_at": None,
+            }
 
-        entry = {
-            "title": book.get("title", ""),
-            "author": book.get("author", ""),
-            "source_pdf": str(pdf),
-            "built_at": datetime.now().isoformat(timespec="seconds"),
-            "seconds": timings.get("seconds"),
-            "decisions": timings.get("decisions", 0),
-            "admitted": master is not None,
-            "checks": check.as_dict(),
-            "master": str(master) if master else None,
-            "built_hash": file_sha256(master) if master else None,
-            "indexed_hash": None,
-            "indexed_at": None,
-        }
+            if master is None:
+                stats["failed" if check.error else "rejected"] += 1
+                state[book_id] = entry
+                _save_state(scriptor_dir, state)
+                if checkpoint:
+                    checkpoint.fail_book(
+                        book_id, "; ".join(check.reasons or [check.error or "?"]))
+                continue
 
-        if master is None:
-            stats["failed" if check.error else "rejected"] += 1
-            state[book_id] = entry
-            _save_state(scriptor_dir, state)
-            if checkpoint:
-                checkpoint.fail_book(book_id, "; ".join(check.reasons or [check.error or "?"]))
-            continue
+            stats["built"] += 1
+            checks = check.as_dict()
+            print(f"         Bundle OK: coverage {_fmt_share(checks['coverage'])}, "
+                  f"attested {_fmt_share(checks['attested'])}, "
+                  f"inherited {_fmt_share(checks['inherited'])}, "
+                  f"{checks['definitions']} notes, {entry['decisions']} open decisions "
+                  f"({timings.get('seconds')}s)")
 
-        stats["built"] += 1
-        checks = check.as_dict()
-        print(f"         Bundle OK: coverage {_fmt_share(checks['coverage'])}, "
-              f"attested {_fmt_share(checks['attested'])}, "
-              f"inherited {_fmt_share(checks['inherited'])}, "
-              f"{checks['definitions']} notes, {entry['decisions']} open decisions "
-              f"({timings.get('seconds')}s)")
-
+        index_error = None
         if args.index:
             if rag is None:
                 rag = _load_rag(library_path, adapter)
@@ -524,15 +549,21 @@ def run(args) -> int:
                 entry["indexed_at"] = datetime.now().isoformat(timespec="seconds")
                 print(f"         Indexed: {result.get('chunks_indexed', '?')} chunks")
             except Exception as exc:
+                # The bundle stands; only the index is behind. The volume stays
+                # unfinished so a resumed run indexes it rather than skipping it.
                 print(f"         Indexing FAILED: {exc}")
-                stats["failed"] += 1
+                stats["index_failed"] += 1
+                index_error = str(exc)
         else:
             queued.append(book_id)
 
         state[book_id] = entry
         _save_state(scriptor_dir, state)
         if checkpoint:
-            checkpoint.complete_book(book_id)
+            if index_error:
+                checkpoint.fail_book(book_id, index_error)
+            else:
+                checkpoint.complete_book(book_id)
 
     if queued:
         path = _queue_file(archilles_dir, adapter)
@@ -545,7 +576,8 @@ def run(args) -> int:
     print(f"\n{'=' * 64}")
     print(f"  Built: {stats['built']}  Skipped: {stats['skipped']}  "
           f"No PDF: {stats['no_pdf']}  Not admitted: {stats['rejected']}  "
-          f"Failed: {stats['failed']}  Indexed: {stats['indexed']}")
+          f"Failed: {stats['failed']}  Indexed: {stats['indexed']}"
+          + (f"  Indexing failed: {stats['index_failed']}" if stats['index_failed'] else ""))
     print(f"{'=' * 64}")
 
     if not args.dry_run:
